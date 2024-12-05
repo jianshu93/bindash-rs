@@ -1,2 +1,5 @@
-# bindash-rs
-Rust port of BinDash software
+## BinDash: Binwise Densified Minhash
+
+one-permutation rolling MinHash with optimal densification
+
+
