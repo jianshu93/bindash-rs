@@ -85,7 +85,7 @@ fn main() {
                 .long("output")
                 .value_name("OUTPUT_FILE")
                 .help("Output file (defaults to stdout)")
-                .required(true)
+                .required(false)
                 .action(ArgAction::Set),
         )
         .get_matches();
