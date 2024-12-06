@@ -3,18 +3,17 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use needletail::{Sequence,parse_fastx_file};
+use needletail::{Sequence, parse_fastx_file};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use kmerutils::sketcharg::{SeqSketcherParams, SketchAlgo};
 use kmerutils::base::{kmergenerator::*, Kmer32bit, Kmer16b32bit, Kmer64bit, CompressedKmerT};
 use kmerutils::sketching::setsketchert::*;
 use kmerutils::sketcharg::DataType;
 use kmerutils::base::alphabet::Alphabet2b;
 use kmerutils::base::sequence::Sequence as SequenceStruct;
-use anndists::dist::Distance;
-use anndists::dist::DistHamming;
+use anndists::dist::{Distance, DistHamming};
 use num;
+use std::path::Path;
 
 fn ascii_to_seq(bases: &[u8]) -> Result<SequenceStruct, ()> {
     let alphabet = Alphabet2b::new();
@@ -24,7 +23,7 @@ fn ascii_to_seq(bases: &[u8]) -> Result<SequenceStruct, ()> {
 } // end of ascii_to_seq
 
 fn main() {
-        // Initialize logger
+    // Initialize logger
     println!("\n ************** initializing logger *****************\n");
     let _ = env_logger::Builder::from_default_env().init();
 
@@ -36,7 +35,7 @@ fn main() {
                 .short('q')
                 .long("query_list")
                 .value_name("QUERY_LIST_FILE")
-                .help("Query genome list file (one FASTA/FNA file path per line)")
+                .help("Query genome list file (one FASTA/FNA file path per line, .gz supported)")
                 .required(true)
                 .action(ArgAction::Set),
         )
@@ -45,7 +44,7 @@ fn main() {
                 .short('r')
                 .long("reference_list")
                 .value_name("REFERENCE_LIST_FILE")
-                .help("Reference genome list file (one FASTA/FNA file path per line)")
+                .help("Reference genome list file (one FASTA/FNA file path per line, .gz supported)")
                 .required(true)
                 .action(ArgAction::Set),
         )
@@ -64,8 +63,18 @@ fn main() {
                 .short('s')
                 .long("sketch_size")
                 .value_name("SKETCH_SIZE")
-                .help("Sketch size")
+                .help("MinHash sketch size")
                 .default_value("2048")
+                .value_parser(clap::value_parser!(usize))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("dens_opt")
+                .short('d')
+                .long("densification")
+                .value_name("DENS_OPT")
+                .help("Densification strategy, 0 for optimal densification, 1 for reverse optimal/faster densification")
+                .default_value("0")
                 .value_parser(clap::value_parser!(usize))
                 .action(ArgAction::Set),
         )
@@ -74,7 +83,7 @@ fn main() {
                 .short('t')
                 .long("threads")
                 .value_name("THREADS")
-                .help("Number of threads")
+                .help("Number of threads to use in parallel")
                 .default_value("1")
                 .value_parser(clap::value_parser!(usize))
                 .action(ArgAction::Set),
@@ -100,6 +109,7 @@ fn main() {
         .to_string();
     let kmer_size = *matches.get_one::<usize>("kmer_size").unwrap();
     let sketch_size = *matches.get_one::<usize>("sketch_size").unwrap();
+    let dens = *matches.get_one::<usize>("dens_opt").unwrap();
     let threads = *matches.get_one::<usize>("threads").unwrap();
     let output = matches.get_one::<String>("output").cloned();
 
@@ -134,273 +144,596 @@ fn main() {
     );
 
     if kmer_size <= 14 {
-        let sketcher = OptDensHashSketch::<Kmer32bit, f32>::new(&sketch_args);
         let nb_alphabet_bits = 2;
-        let kmer_hash_fn_32bit = | kmer : &Kmer32bit | -> <Kmer32bit as CompressedKmerT>::Val {
-            let mask : <Kmer32bit as CompressedKmerT>::Val = num::NumCast::from::<u64>((0b1 << nb_alphabet_bits*kmer.get_nb_base()) - 1).unwrap();
+        let kmer_hash_fn_32bit = |kmer: &Kmer32bit| -> <Kmer32bit as CompressedKmerT>::Val {
+            let mask: <Kmer32bit as CompressedKmerT>::Val =
+                num::NumCast::from::<u64>((1u64 << (nb_alphabet_bits * kmer.get_nb_base())) - 1)
+                    .unwrap();
             let hashval = kmer.get_compressed_value() & mask;
             hashval
         };
 
-        println!("Sketching query genomes...");
-        let query_sketches = {
-            let sketches = query_genomes
+        if dens == 0 {
+            let sketcher = OptDensHashSketch::<Kmer32bit, f32>::new(&sketch_args);
+
+            println!("Sketching query genomes...");
+            let query_sketches = {
+                query_genomes
+                    .par_iter()
+                    .map(|path| {
+                        let mut sequences = Vec::new();
+                        let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
+                        while let Some(record) = reader.next() {
+                            let seq_record = record.expect("Error reading sequence record");
+                            let seq_seq = seq_record.normalize(false).into_owned();
+                            let seq = ascii_to_seq(&seq_seq).unwrap();
+                            sequences.push(seq);
+                        }
+                        let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
+                        let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_32bit);
+                        (path.clone(), signature[0].clone())
+                    })
+                    .collect::<HashMap<String, Vec<f32>>>()
+            };
+
+            println!("Sketching reference genomes...");
+            let reference_sketches = {
+                reference_genomes
+                    .par_iter()
+                    .map(|path| {
+                        let mut sequences = Vec::new();
+                        let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
+                        while let Some(record) = reader.next() {
+                            let seq_record = record.expect("Error reading sequence record");
+                            let seq_seq = seq_record.normalize(false).into_owned();
+                            let seq = ascii_to_seq(&seq_seq).unwrap();
+                            sequences.push(seq);
+                        }
+                        let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
+                        let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_32bit);
+                        (path.clone(), signature[0].clone())
+                    })
+                    .collect::<HashMap<String, Vec<f32>>>()
+            };
+
+            println!("Performing pairwise comparisons...");
+            let results: Vec<(String, String, f64)> = query_genomes
                 .par_iter()
-                .map(|path| {
-                    println!("Sketching genome: {}", path);
-                    let mut sequences = Vec::new();
-                    let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
-                    while let Some(record) = reader.next() {
-                        let seq_record = record.expect("Error reading sequence record");
-                        let seq_seq = seq_record.normalize(false).into_owned();
-                        let seq = ascii_to_seq(&seq_seq).unwrap();
-                        sequences.push(seq);
-                    }
-                    let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
-                    let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_32bit);
-                    (path.clone(), signature[0].clone())
+                .flat_map(|query_path| {
+                    let query_signature = &query_sketches[query_path];
+                    reference_genomes
+                        .iter()
+                        .map(|reference_path| {
+                            let reference_signature = &reference_sketches[reference_path];
+                            let dist_hamming = DistHamming;
+                            let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
+                            let j = 1.0 - hamming_distance;
+                            let numerator = 2.0 * j;
+                            let denominator = 1.0 + j;
+                            let fraction = (numerator as f64) / (denominator as f64);
+                            let distance = -fraction.ln() / (kmer_size as f64);
+                            (query_path.clone(), reference_path.clone(), distance)
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect::<HashMap<String, Vec<f32>>>();
-            sketches
-        };
+                .collect();
 
-        println!("Sketching reference genomes...");
-        let reference_sketches = {
-            let sketches = reference_genomes
+            let mut output_writer: Box<dyn Write> = match output {
+                Some(filename) => Box::new(BufWriter::new(File::create(&filename).expect("Cannot create output file"))),
+                None => Box::new(BufWriter::new(io::stdout())),
+            };
+
+            writeln!(output_writer, "Query\tReference\tDistance").expect("Error writing header");
+            for (query_name, reference_name, distance) in &results {
+                let query_basename = Path::new(&query_name)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(&query_name);
+
+                let reference_basename = Path::new(&reference_name)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(&reference_name);
+
+                let distance = if query_basename == reference_basename {
+                    0.0
+                } else {
+                    *distance
+                };
+
+                writeln!(output_writer, "{}\t{}\t{:.6}", query_name, reference_name, distance)
+                    .expect("Error writing output");
+            }
+
+        } else if dens == 1 {
+            let sketcher = RevOptDensHashSketch::<Kmer32bit, f32>::new(&sketch_args);
+
+            println!("Sketching query genomes...");
+            let query_sketches = {
+                query_genomes
+                    .par_iter()
+                    .map(|path| {
+                        let mut sequences = Vec::new();
+                        let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
+                        while let Some(record) = reader.next() {
+                            let seq_record = record.expect("Error reading sequence record");
+                            let seq_seq = seq_record.normalize(false).into_owned();
+                            let seq = ascii_to_seq(&seq_seq).unwrap();
+                            sequences.push(seq);
+                        }
+                        let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
+                        let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_32bit);
+                        (path.clone(), signature[0].clone())
+                    })
+                    .collect::<HashMap<String, Vec<f32>>>()
+            };
+
+            println!("Sketching reference genomes...");
+            let reference_sketches = {
+                reference_genomes
+                    .par_iter()
+                    .map(|path| {
+                        let mut sequences = Vec::new();
+                        let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
+                        while let Some(record) = reader.next() {
+                            let seq_record = record.expect("Error reading sequence record");
+                            let seq_seq = seq_record.normalize(false).into_owned();
+                            let seq = ascii_to_seq(&seq_seq).unwrap();
+                            sequences.push(seq);
+                        }
+                        let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
+                        let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_32bit);
+                        (path.clone(), signature[0].clone())
+                    })
+                    .collect::<HashMap<String, Vec<f32>>>()
+            };
+
+            println!("Performing pairwise comparisons...");
+            let results: Vec<(String, String, f64)> = query_genomes
                 .par_iter()
-                .map(|path| {
-                    println!("Sketching genome: {}", path);
-                    let mut sequences = Vec::new();
-                    let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
-                    while let Some(record) = reader.next() {
-                        let seq_record = record.expect("Error reading sequence record");
-                        let seq_seq = seq_record.normalize(false).into_owned();
-                        let seq = ascii_to_seq(&seq_seq).unwrap();
-                        sequences.push(seq);
-                    }
-                    let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
-                    let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_32bit);
-                    (path.clone(), signature[0].clone())
+                .flat_map(|query_path| {
+                    let query_signature = &query_sketches[query_path];
+                    reference_genomes
+                        .iter()
+                        .map(|reference_path| {
+                            let reference_signature = &reference_sketches[reference_path];
+                            let dist_hamming = DistHamming;
+                            let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
+                            let j = 1.0 - hamming_distance;
+                            let numerator = 2.0 * j;
+                            let denominator = 1.0 + j;
+                            let fraction = (numerator as f64) / (denominator as f64);
+                            let distance = -fraction.ln() / (kmer_size as f64);
+                            (query_path.clone(), reference_path.clone(), distance)
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect::<HashMap<String, Vec<f32>>>();
-            sketches
-        };
+                .collect();
 
-        let writer: Box<dyn Write + Send> = match output {
-            Some(filename) => {
-                let file = File::create(filename).expect("Cannot create output file");
-                Box::new(BufWriter::new(file))
+            let mut output_writer: Box<dyn Write> = match output {
+                Some(filename) => Box::new(BufWriter::new(File::create(&filename).expect("Cannot create output file"))),
+                None => Box::new(BufWriter::new(io::stdout())),
+            };
+
+            writeln!(output_writer, "Query\tReference\tDistance").expect("Error writing header");
+            for (query_name, reference_name, distance) in &results {
+                let query_basename = Path::new(&query_name)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(&query_name);
+
+                let reference_basename = Path::new(&reference_name)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(&reference_name);
+
+                let distance = if query_basename == reference_basename {
+                    0.0
+                } else {
+                    *distance
+                };
+
+                writeln!(output_writer, "{}\t{}\t{:.6}", query_name, reference_name, distance)
+                    .expect("Error writing output");
             }
-            None => Box::new(BufWriter::new(io::stdout())),
-        };
 
-        let writer = Arc::new(Mutex::new(writer));
-
-        println!("Performing pairwise comparisons...");
-        query_genomes.par_iter().for_each(|query_path| {
-            let query_signature = &query_sketches[query_path];
-
-            for reference_path in &reference_genomes {
-                let reference_signature = &reference_sketches[reference_path];
-
-                let dist_hamming = DistHamming;
-                let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
-                let j = 1.0 - hamming_distance;
-
-                let numerator = 2.0 * j;
-                let denominator = 1.0 + j;
-                let fraction: f32 = numerator / denominator;
-                let distance = -fraction.ln() / (kmer_size as f32);
-
-                let mut writer = writer.lock().unwrap();
-                writeln!(
-                    writer,
-                    "{}\t{}\t{}",
-                    query_path, reference_path, distance
-                )
-                .expect("Error writing output");
-            }
-        });
+        } else {
+            panic!("Only optimal densification and reverse optimal densification are supported");
+        }
 
     } else if kmer_size == 16 {
-        let sketcher = OptDensHashSketch::<Kmer16b32bit, f32>::new(&sketch_args);
         let nb_alphabet_bits = 2;
-        let kmer_hash_fn_16b32bit = | kmer : &Kmer16b32bit | -> <Kmer16b32bit as CompressedKmerT>::Val {
-            let canonical =  kmer.reverse_complement().min(*kmer);
-            let mask : <Kmer16b32bit as CompressedKmerT>::Val = num::NumCast::from::<u64>((0b1 << nb_alphabet_bits*kmer.get_nb_base()) - 1).unwrap();
+        let kmer_hash_fn_16b32bit = |kmer: &Kmer16b32bit| -> <Kmer16b32bit as CompressedKmerT>::Val {
+            let canonical = kmer.reverse_complement().min(*kmer);
+            let mask: <Kmer16b32bit as CompressedKmerT>::Val =
+                num::NumCast::from::<u64>((1u64 << (nb_alphabet_bits * kmer.get_nb_base())) - 1)
+                    .unwrap();
             let hashval = canonical.get_compressed_value() & mask;
             hashval
         };
 
-        println!("Sketching query genomes...");
-        let query_sketches = {
-            let sketches = query_genomes
+        if dens == 0 {
+            let sketcher = OptDensHashSketch::<Kmer16b32bit, f32>::new(&sketch_args);
+
+            println!("Sketching query genomes...");
+            let query_sketches = {
+                query_genomes
+                    .par_iter()
+                    .map(|path| {
+                        let mut sequences = Vec::new();
+                        let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
+                        while let Some(record) = reader.next() {
+                            let seq_record = record.expect("Error reading sequence record");
+                            let seq_seq = seq_record.normalize(false).into_owned();
+                            let seq = ascii_to_seq(&seq_seq).unwrap();
+                            sequences.push(seq);
+                        }
+                        let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
+                        let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_16b32bit);
+                        (path.clone(), signature[0].clone())
+                    })
+                    .collect::<HashMap<String, Vec<f32>>>()
+            };
+
+            println!("Sketching reference genomes...");
+            let reference_sketches = {
+                reference_genomes
+                    .par_iter()
+                    .map(|path| {
+                        let mut sequences = Vec::new();
+                        let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
+                        while let Some(record) = reader.next() {
+                            let seq_record = record.expect("Error reading sequence record");
+                            let seq_seq = seq_record.normalize(false).into_owned();
+                            let seq = ascii_to_seq(&seq_seq).unwrap();
+                            sequences.push(seq);
+                        }
+                        let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
+                        let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_16b32bit);
+                        (path.clone(), signature[0].clone())
+                    })
+                    .collect::<HashMap<String, Vec<f32>>>()
+            };
+
+            println!("Performing pairwise comparisons...");
+            let results: Vec<(String, String, f64)> = query_genomes
                 .par_iter()
-                .map(|path| {
-                    println!("Sketching genome: {}", path);
-                    let mut sequences = Vec::new();
-                    let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
-                    while let Some(record) = reader.next() {
-                        let seq_record = record.expect("Error reading sequence record");
-                        let seq_seq = seq_record.normalize(false).into_owned();
-                        let seq = ascii_to_seq(&seq_seq).unwrap();
-                        sequences.push(seq);
-                    }
-                    let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
-                    let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_16b32bit);
-                    (path.clone(), signature[0].clone())
+                .flat_map(|query_path| {
+                    let query_signature = &query_sketches[query_path];
+                    reference_genomes
+                        .iter()
+                        .map(|reference_path| {
+                            let reference_signature = &reference_sketches[reference_path];
+                            let dist_hamming = DistHamming;
+                            let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
+                            let j = 1.0 - hamming_distance;
+                            let numerator = 2.0 * j;
+                            let denominator = 1.0 + j;
+                            let fraction = (numerator as f64) / (denominator as f64);
+                            let distance = -fraction.ln() / (kmer_size as f64);
+                            (query_path.clone(), reference_path.clone(), distance)
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect::<HashMap<String, Vec<f32>>>();
-            sketches
-        };
+                .collect();
 
-        println!("Sketching reference genomes...");
-        let reference_sketches = {
-            let sketches = reference_genomes
+            let mut output_writer: Box<dyn Write> = match output {
+                Some(filename) => Box::new(BufWriter::new(File::create(&filename).expect("Cannot create output file"))),
+                None => Box::new(BufWriter::new(io::stdout())),
+            };
+
+            writeln!(output_writer, "Query\tReference\tDistance").expect("Error writing header");
+            for (query_name, reference_name, distance) in &results {
+                let query_basename = Path::new(&query_name)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(&query_name);
+                let reference_basename = Path::new(&reference_name)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(&reference_name);
+
+                let distance = if query_basename == reference_basename {
+                    0.0
+                } else {
+                    *distance
+                };
+
+                writeln!(output_writer, "{}\t{}\t{:.6}", query_name, reference_name, distance)
+                    .expect("Error writing output");
+            }
+
+        } else if dens == 1 {
+            let sketcher = RevOptDensHashSketch::<Kmer16b32bit, f32>::new(&sketch_args);
+
+            println!("Sketching query genomes...");
+            let query_sketches = {
+                query_genomes
+                    .par_iter()
+                    .map(|path| {
+                        let mut sequences = Vec::new();
+                        let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
+                        while let Some(record) = reader.next() {
+                            let seq_record = record.expect("Error reading sequence record");
+                            let seq_seq = seq_record.normalize(false).into_owned();
+                            let seq = ascii_to_seq(&seq_seq).unwrap();
+                            sequences.push(seq);
+                        }
+                        let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
+                        let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_16b32bit);
+                        (path.clone(), signature[0].clone())
+                    })
+                    .collect::<HashMap<String, Vec<f32>>>()
+            };
+
+            println!("Sketching reference genomes...");
+            let reference_sketches = {
+                reference_genomes
+                    .par_iter()
+                    .map(|path| {
+                        let mut sequences = Vec::new();
+                        let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
+                        while let Some(record) = reader.next() {
+                            let seq_record = record.expect("Error reading sequence record");
+                            let seq_seq = seq_record.normalize(false).into_owned();
+                            let seq = ascii_to_seq(&seq_seq).unwrap();
+                            sequences.push(seq);
+                        }
+                        let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
+                        let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_16b32bit);
+                        (path.clone(), signature[0].clone())
+                    })
+                    .collect::<HashMap<String, Vec<f32>>>()
+            };
+
+            println!("Performing pairwise comparisons...");
+            let results: Vec<(String, String, f64)> = query_genomes
                 .par_iter()
-                .map(|path| {
-                    println!("Sketching genome: {}", path);
-                    let mut sequences = Vec::new();
-                    let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
-                    while let Some(record) = reader.next() {
-                        let seq_record = record.expect("Error reading sequence record");
-                        let seq_seq = seq_record.normalize(false).into_owned();
-                        let seq = ascii_to_seq(&seq_seq).unwrap();
-                        sequences.push(seq);
-                    }
-                    let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
-                    let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_16b32bit);
-                    (path.clone(), signature[0].clone())
+                .flat_map(|query_path| {
+                    let query_signature = &query_sketches[query_path];
+                    reference_genomes
+                        .iter()
+                        .map(|reference_path| {
+                            let reference_signature = &reference_sketches[reference_path];
+                            let dist_hamming = DistHamming;
+                            let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
+                            let j = 1.0 - hamming_distance;
+                            let numerator = 2.0 * j;
+                            let denominator = 1.0 + j;
+                            let fraction = (numerator as f64) / (denominator as f64);
+                            let distance = -fraction.ln() / (kmer_size as f64);
+                            (query_path.clone(), reference_path.clone(), distance)
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect::<HashMap<String, Vec<f32>>>();
-            sketches
-        };
+                .collect();
 
-        let writer: Box<dyn Write + Send> = match output {
-            Some(filename) => {
-                let file = File::create(filename).expect("Cannot create output file");
-                Box::new(BufWriter::new(file))
+            let mut output_writer: Box<dyn Write> = match output {
+                Some(filename) => Box::new(BufWriter::new(File::create(&filename).expect("Cannot create output file"))),
+                None => Box::new(BufWriter::new(io::stdout())),
+            };
+
+            writeln!(output_writer, "Query\tReference\tDistance").expect("Error writing header");
+            for (query_name, reference_name, distance) in &results {
+                let query_basename = Path::new(&query_name)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(&query_name);
+                let reference_basename = Path::new(&reference_name)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(&reference_name);
+
+                let distance = if query_basename == reference_basename {
+                    0.0
+                } else {
+                    *distance
+                };
+
+                writeln!(output_writer, "{}\t{}\t{:.6}", query_name, reference_name, distance)
+                    .expect("Error writing output");
             }
-            None => Box::new(BufWriter::new(io::stdout())),
-        };
 
-        let writer = Arc::new(Mutex::new(writer));
-
-        println!("Performing pairwise comparisons...");
-        query_genomes.par_iter().for_each(|query_path| {
-            let query_signature = &query_sketches[query_path];
-
-            for reference_path in &reference_genomes {
-                let reference_signature = &reference_sketches[reference_path];
-
-                let dist_hamming = DistHamming;
-                let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
-                let j = 1.0 - hamming_distance;
-
-                let numerator = 2.0 * j;
-                let denominator = 1.0 + j;
-                let fraction: f32  = numerator / denominator;
-                let distance = -fraction.ln() / (kmer_size as f32);
-
-                let mut writer = writer.lock().unwrap();
-                writeln!(
-                    writer,
-                    "{}\t{}\t{}",
-                    query_path, reference_path, distance
-                )
-                .expect("Error writing output");
-            }
-        });
+        } else {
+            panic!("Only optimal densification and reverse optimal densification are supported");
+        }
 
     } else if kmer_size <= 32 {
-        let sketcher = OptDensHashSketch::<Kmer64bit, f32>::new(&sketch_args);
         let nb_alphabet_bits = 2;
-        let kmer_hash_fn_64bit = | kmer : &Kmer64bit | -> <Kmer64bit as CompressedKmerT>::Val {
-            let canonical =  kmer.reverse_complement().min(*kmer);
-            let mask : <Kmer64bit as CompressedKmerT>::Val = num::NumCast::from::<u64>((0b1 << nb_alphabet_bits*kmer.get_nb_base()) - 1).unwrap();
+        let kmer_hash_fn_64bit = |kmer: &Kmer64bit| -> <Kmer64bit as CompressedKmerT>::Val {
+            let canonical = kmer.reverse_complement().min(*kmer);
+            let mask: <Kmer64bit as CompressedKmerT>::Val =
+                num::NumCast::from::<u64>((1u64 << (nb_alphabet_bits * kmer.get_nb_base())) - 1)
+                    .unwrap();
             let hashval = canonical.get_compressed_value() & mask;
             hashval
         };
 
-        println!("Sketching query genomes...");
-        let query_sketches = {
-            let sketches = query_genomes
+        if dens == 0 {
+            let sketcher = OptDensHashSketch::<Kmer64bit, f32>::new(&sketch_args);
+
+            println!("Sketching query genomes...");
+            let query_sketches = {
+                query_genomes
+                    .par_iter()
+                    .map(|path| {
+                        let mut sequences = Vec::new();
+                        let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
+                        while let Some(record) = reader.next() {
+                            let seq_record = record.expect("Error reading sequence record");
+                            let seq_seq = seq_record.normalize(false).into_owned();
+                            let seq = ascii_to_seq(&seq_seq).unwrap();
+                            sequences.push(seq);
+                        }
+                        let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
+                        let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_64bit);
+                        (path.clone(), signature[0].clone())
+                    })
+                    .collect::<HashMap<String, Vec<f32>>>()
+            };
+
+            println!("Sketching reference genomes...");
+            let reference_sketches = {
+                reference_genomes
+                    .par_iter()
+                    .map(|path| {
+                        let mut sequences = Vec::new();
+                        let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
+                        while let Some(record) = reader.next() {
+                            let seq_record = record.expect("Error reading sequence record");
+                            let seq_seq = seq_record.normalize(false).into_owned();
+                            let seq = ascii_to_seq(&seq_seq).unwrap();
+                            sequences.push(seq);
+                        }
+                        let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
+                        let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_64bit);
+                        (path.clone(), signature[0].clone())
+                    })
+                    .collect::<HashMap<String, Vec<f32>>>()
+            };
+
+            println!("Performing pairwise comparisons...");
+            let results: Vec<(String, String, f64)> = query_genomes
                 .par_iter()
-                .map(|path| {
-                    println!("Sketching genome: {}", path);
-                    let mut sequences = Vec::new();
-                    let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
-                    while let Some(record) = reader.next() {
-                        let seq_record = record.expect("Error reading sequence record");
-                        let seq_seq = seq_record.normalize(false).into_owned();
-                        let seq = ascii_to_seq(&seq_seq).unwrap();
-                        sequences.push(seq);
-                    }
-                    let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
-                    let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_64bit);
-                    (path.clone(), signature[0].clone())
+                .flat_map(|query_path| {
+                    let query_signature = &query_sketches[query_path];
+                    reference_genomes
+                        .iter()
+                        .map(|reference_path| {
+                            let reference_signature = &reference_sketches[reference_path];
+                            let dist_hamming = DistHamming;
+                            let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
+                            let j = 1.0 - hamming_distance;
+                            let numerator = 2.0 * j;
+                            let denominator = 1.0 + j;
+                            let fraction = (numerator as f64) / (denominator as f64);
+                            let distance = -fraction.ln() / (kmer_size as f64);
+                            (query_path.clone(), reference_path.clone(), distance)
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect::<HashMap<String, Vec<f32>>>();
-            sketches
-        };
+                .collect();
 
-        println!("Sketching reference genomes...");
-        let reference_sketches = {
-            let sketches = reference_genomes
+            let mut output_writer: Box<dyn Write> = match output {
+                Some(filename) => Box::new(BufWriter::new(File::create(&filename).expect("Cannot create output file"))),
+                None => Box::new(BufWriter::new(io::stdout())),
+            };
+
+            writeln!(output_writer, "Query\tReference\tDistance").expect("Error writing header");
+            for (query_name, reference_name, distance) in &results {
+                let query_basename = Path::new(&query_name)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(&query_name);
+                let reference_basename = Path::new(&reference_name)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(&reference_name);
+
+                let distance = if query_basename == reference_basename {
+                    0.0
+                } else {
+                    *distance
+                };
+
+                writeln!(output_writer, "{}\t{}\t{:.6}", query_name, reference_name, distance)
+                    .expect("Error writing output");
+            }
+
+        } else if dens == 1 {
+            let sketcher = RevOptDensHashSketch::<Kmer64bit, f32>::new(&sketch_args);
+
+            println!("Sketching query genomes...");
+            let query_sketches = {
+                query_genomes
+                    .par_iter()
+                    .map(|path| {
+                        let mut sequences = Vec::new();
+                        let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
+                        while let Some(record) = reader.next() {
+                            let seq_record = record.expect("Error reading sequence record");
+                            let seq_seq = seq_record.normalize(false).into_owned();
+                            let seq = ascii_to_seq(&seq_seq).unwrap();
+                            sequences.push(seq);
+                        }
+                        let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
+                        let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_64bit);
+                        (path.clone(), signature[0].clone())
+                    })
+                    .collect::<HashMap<String, Vec<f32>>>()
+            };
+
+            println!("Sketching reference genomes...");
+            let reference_sketches = {
+                reference_genomes
+                    .par_iter()
+                    .map(|path| {
+                        let mut sequences = Vec::new();
+                        let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
+                        while let Some(record) = reader.next() {
+                            let seq_record = record.expect("Error reading sequence record");
+                            let seq_seq = seq_record.normalize(false).into_owned();
+                            let seq = ascii_to_seq(&seq_seq).unwrap();
+                            sequences.push(seq);
+                        }
+                        let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
+                        let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_64bit);
+                        (path.clone(), signature[0].clone())
+                    })
+                    .collect::<HashMap<String, Vec<f32>>>()
+            };
+
+            println!("Performing pairwise comparisons...");
+            let results: Vec<(String, String, f64)> = query_genomes
                 .par_iter()
-                .map(|path| {
-                    println!("Sketching genome: {}", path);
-                    let mut sequences = Vec::new();
-                    let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
-                    while let Some(record) = reader.next() {
-                        let seq_record = record.expect("Error reading sequence record");
-                        let seq_seq = seq_record.normalize(false).into_owned();
-                        let seq = ascii_to_seq(&seq_seq).unwrap();
-                        sequences.push(seq);
-                    }
-                    let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
-                    let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, &kmer_hash_fn_64bit);
-                    (path.clone(), signature[0].clone())
+                .flat_map(|query_path| {
+                    let query_signature = &query_sketches[query_path];
+                    reference_genomes
+                        .iter()
+                        .map(|reference_path| {
+                            let reference_signature = &reference_sketches[reference_path];
+                            let dist_hamming = DistHamming;
+                            let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
+                            let j = 1.0 - hamming_distance;
+                            let numerator = 2.0 * j;
+                            let denominator = 1.0 + j;
+                            let fraction = (numerator as f64) / (denominator as f64);
+                            let distance = -fraction.ln() / (kmer_size as f64);
+                            (query_path.clone(), reference_path.clone(), distance)
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect::<HashMap<String, Vec<f32>>>();
-            sketches
-        };
+                .collect();
 
-        let writer: Box<dyn Write + Send> = match output {
-            Some(filename) => {
-                let file = File::create(filename).expect("Cannot create output file");
-                Box::new(BufWriter::new(file))
+            let mut output_writer: Box<dyn Write> = match output {
+                Some(filename) => Box::new(BufWriter::new(File::create(&filename).expect("Cannot create output file"))),
+                None => Box::new(BufWriter::new(io::stdout())),
+            };
+
+            writeln!(output_writer, "Query\tReference\tDistance").expect("Error writing header");
+            for (query_name, reference_name, distance) in &results {
+                let query_basename = Path::new(&query_name)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(&query_name);
+                let reference_basename = Path::new(&reference_name)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(&reference_name);
+
+                let distance = if query_basename == reference_basename {
+                    0.0
+                } else {
+                    *distance
+                };
+
+                writeln!(output_writer, "{}\t{}\t{:.6}", query_name, reference_name, distance)
+                    .expect("Error writing output");
             }
-            None => Box::new(BufWriter::new(io::stdout())),
-        };
 
-        let writer = Arc::new(Mutex::new(writer));
-
-        println!("Performing pairwise comparisons...");
-        query_genomes.par_iter().for_each(|query_path| {
-            let query_signature = &query_sketches[query_path];
-
-            for reference_path in &reference_genomes {
-                let reference_signature = &reference_sketches[reference_path];
-
-                let dist_hamming = DistHamming;
-                let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
-                let j = 1.0 - hamming_distance;
-
-                let numerator = 2.0 * j;
-                let denominator = 1.0 + j;
-                let fraction: f32 = numerator / denominator;
-                let distance = - fraction.ln() / (kmer_size as f32);
-
-                let mut writer = writer.lock().unwrap();
-                writeln!(
-                    writer,
-                    "{}\t{}\t{}",
-                    query_path, reference_path, distance
-                )
-                .expect("Error writing output");
-            }
-        });
+        } else {
+            panic!("Only optimal densification and reverse optimal densification are supported");
+        }
 
     } else {
         panic!("kmers cannot be 15 or greater than 32");
