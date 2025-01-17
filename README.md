@@ -1,3 +1,6 @@
+[![Latest Version](https://img.shields.io/crates/v/bindash?style=for-the-badge&color=mediumpurple&logo=rust)](https://crates.io/crates/bindash)
+[![docs.rs](https://img.shields.io/docsrs/bindash?style=for-the-badge&logo=docs.rs&color=mediumseagreen)](https://docs.rs/bindash/latest/bindash/)
+
 ## BinDash: Binwise Densified Minhash
 
 One Permutation MinHash with Optimal/Faster Densification in Rust
