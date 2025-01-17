@@ -6,6 +6,12 @@
 One Permutation MinHash with Optimal/Faster Densification in Rust
 
 ## Install
+### Install via cargo
+```bash
+### Install from cargo, install Rustup first here: https://rustup.rs, cargo will be installed by default
+cargo install bindash
+```
+### Compile from source
 ```bash
 git clone https://github.com/jianshu93/bindash-rs
 cd bindash-rs
