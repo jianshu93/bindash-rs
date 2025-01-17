@@ -2,8 +2,10 @@
 name = "bindash"
 version = "0.1.1"
 edition = "2021"
+repository = "https://github.com/jianshu93/bindash-rs"
+keywords = ["genomes", "minhash", "sketching"]
 license = "MIT OR Apache-2.0"
-description = "One Permutation Hashing, Optimal Densification"
+description = "One Permutation Hashing, Optimal Densification MinHash for genomes"
 
 [dependencies]
 clap = "4.3"
