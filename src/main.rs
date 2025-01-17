@@ -207,6 +207,11 @@ fn main() {
                             let reference_signature = &reference_sketches[reference_path];
                             let dist_hamming = DistHamming;
                             let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
+                            let hamming_distance = if hamming_distance == 0.0 {
+                                std::f32::EPSILON // Use a small value close to zero
+                            } else {
+                                hamming_distance
+                            };
                             let j = 1.0 - hamming_distance;
                             let numerator = 2.0 * j;
                             let denominator = 1.0 + j;
@@ -299,6 +304,11 @@ fn main() {
                             let reference_signature = &reference_sketches[reference_path];
                             let dist_hamming = DistHamming;
                             let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
+                            let hamming_distance = if hamming_distance == 0.0 {
+                                std::f32::EPSILON // Use a small value close to zero
+                            } else {
+                                hamming_distance
+                            };
                             let j = 1.0 - hamming_distance;
                             let numerator = 2.0 * j;
                             let denominator = 1.0 + j;
@@ -406,6 +416,11 @@ fn main() {
                             let reference_signature = &reference_sketches[reference_path];
                             let dist_hamming = DistHamming;
                             let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
+                            let hamming_distance = if hamming_distance == 0.0 {
+                                std::f32::EPSILON // Use a small value close to zero
+                            } else {
+                                hamming_distance
+                            };
                             let j = 1.0 - hamming_distance;
                             let numerator = 2.0 * j;
                             let denominator = 1.0 + j;
@@ -497,6 +512,11 @@ fn main() {
                             let reference_signature = &reference_sketches[reference_path];
                             let dist_hamming = DistHamming;
                             let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
+                            let hamming_distance = if hamming_distance == 0.0 {
+                                std::f32::EPSILON // Use a small value close to zero
+                            } else {
+                                hamming_distance
+                            };
                             let j = 1.0 - hamming_distance;
                             let numerator = 2.0 * j;
                             let denominator = 1.0 + j;
@@ -603,6 +623,11 @@ fn main() {
                             let reference_signature = &reference_sketches[reference_path];
                             let dist_hamming = DistHamming;
                             let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
+                            let hamming_distance = if hamming_distance == 0.0 {
+                                std::f32::EPSILON // Use a small value close to zero
+                            } else {
+                                hamming_distance
+                            };
                             let j = 1.0 - hamming_distance;
                             let numerator = 2.0 * j;
                             let denominator = 1.0 + j;
@@ -694,6 +719,11 @@ fn main() {
                             let reference_signature = &reference_sketches[reference_path];
                             let dist_hamming = DistHamming;
                             let hamming_distance = dist_hamming.eval(&query_signature, &reference_signature);
+                            let hamming_distance = if hamming_distance == 0.0 {
+                                std::f32::EPSILON // Use a small value close to zero
+                            } else {
+                                hamming_distance
+                            };
                             let j = 1.0 - hamming_distance;
                             let numerator = 2.0 * j;
                             let denominator = 1.0 + j;
