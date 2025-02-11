@@ -5,6 +5,11 @@
 One Permutation MinHash with Optimal/Faster Densification in Rust
 
 ## Install
+### Install via bioconda
+```bash
+conda install -c bioconda -c conda-forge bindash-rs
+```
+
 ### Install via cargo
 ```bash
 ### Install from cargo, install Rustup first here: https://rustup.rs, cargo will be installed by default

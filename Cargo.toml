@@ -1,17 +1,15 @@
 [package]
 name = "bindash"
-version = "0.1.1"
+version = "0.1.0"
 edition = "2021"
-repository = "https://github.com/jianshu93/bindash-rs"
-keywords = ["genomes", "minhash", "sketching"]
 license = "MIT OR Apache-2.0"
-description = "One Permutation Hashing, Optimal Densification MinHash for genomes"
+description = "One Permutation Hashing, Optimal Densification, Genomics"
 
 [dependencies]
 clap = "4.3"
 needletail = "0.5.1"
 rayon = "1.5"
-kmerutils = { version = "0.0.11", features = ["simdeez_f"]}
+kmerutils = { version = "=0.0.12", features = ["simdeez_f"]}
 anndists = { version = "0.1.2", features = ["simdeez_f"] }
 num = { version = "0.4" }
 env_logger = { version = "0.11" }
