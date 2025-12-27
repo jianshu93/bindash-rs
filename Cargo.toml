@@ -1,15 +1,16 @@
 [package]
 name = "bindash"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "One Permutation Hashing, Optimal Densification, Genomics"
 
 [dependencies]
 clap = "4.3"
-needletail = "0.5.1"
+needletail = "0.6.0"
 rayon = "1.5"
-kmerutils = { version = "=0.0.12", features = ["simdeez_f"]}
-anndists = { version = "0.1.2", features = ["simdeez_f"] }
+# kmerutils = { version = "0.0.14", features = ["stdsimd"]}
+kmerutils = { git = "https://github.com/jianshu93/kmerutils" }
+anndists = { version = "0.1.3", features = ["stdsimd"] }
 num = { version = "0.4" }
 env_logger = { version = "0.11" }
