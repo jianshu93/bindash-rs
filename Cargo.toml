@@ -8,7 +8,7 @@ description = "One Permutation Hashing, Optimal Densification, Genomics"
 
 [[bin]]
 
-name = "dartunifrac-cuda"
+name = "bindash-cuda"
 path = "src/main.rs"
 
 [dependencies]
