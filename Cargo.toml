@@ -15,3 +15,11 @@ kmerutils = { git = "https://github.com/jianshu93/kmerutils" }
 anndists = { git = "https://github.com/jianshu93/anndists", features = ["stdsimd"] }
 num = { version = "0.4" }
 env_logger = { version = "0.11" }
+cudarc = { version = "0.18.1", features = [
+    "driver",
+    "nvrtc",
+    "cuda-version-from-build-system"], optional = true }
+
+[features]
+default = []
+cuda = ["dep:cudarc"]

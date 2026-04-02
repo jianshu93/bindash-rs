@@ -28,7 +28,14 @@ use kmerutils::sketching::setsketchert::{
     SeqSketcherT, // trait
 };
 
+#[cfg(not(feature = "cuda"))]
 use anndists::dist::{Distance, DistHamming};
+
+#[cfg(feature = "cuda")]
+mod disthamming_gpu;
+
+#[cfg(feature = "cuda")]
+use disthamming_gpu::pairwise_hamming_rect_multi_gpu_u16;
 
 /// Converts ASCII-encoded bases (from Needletail) into our `SequenceStruct`.
 fn ascii_to_seq(bases: &[u8]) -> Result<SequenceStruct, ()> {
@@ -91,15 +98,7 @@ where
 ///    distance = -ln( (2*j) / (1 + j) ) / kmer_size
 ///
 /// where j = 1 - hamming_distance (assuming DistHamming returns normalized distance).
-fn compute_distance<Sig>(query_sig: &[Sig], reference_sig: &[Sig], kmer_size: usize) -> f64
-where
-    Sig: Send + Sync,
-    DistHamming: Distance<Sig>,
-{
-    let dist_hamming = DistHamming;
-
-    let h: f64 = dist_hamming.eval(query_sig, reference_sig) as f64;
-
+fn compute_distance_from_hamming(h: f64, kmer_size: usize) -> f64 {
     let h = if h <= 0.0 { 0.0 } else if h >= 1.0 { 1.0 } else { h };
 
     let mut j = 1.0 - h;
@@ -111,6 +110,18 @@ where
     -fraction.ln() / (kmer_size as f64)
 }
 
+#[cfg(not(feature = "cuda"))]
+fn compute_distance<Sig>(query_sig: &[Sig], reference_sig: &[Sig], kmer_size: usize) -> f64
+where
+    Sig: Send + Sync,
+    DistHamming: Distance<Sig>,
+{
+    let dist_hamming = DistHamming;
+    let h: f64 = dist_hamming.eval(query_sig, reference_sig) as f64;
+    compute_distance_from_hamming(h, kmer_size)
+}
+
+#[cfg(not(feature = "cuda"))]
 fn write_results<Sig>(
     output: Option<String>,
     query_genomes: &[String],
@@ -168,6 +179,107 @@ fn write_results<Sig>(
     }
 }
 
+#[cfg(feature = "cuda")]
+fn write_results_gpu_u16(
+    output: Option<String>,
+    query_genomes: &[String],
+    reference_genomes: &[String],
+    query_sketches: &HashMap<String, Vec<u16>>,
+    reference_sketches: &HashMap<String, Vec<u16>>,
+    kmer_size: usize,
+) {
+    let mut output_writer: Box<dyn Write> = match output {
+        Some(filename) => {
+            Box::new(BufWriter::new(File::create(&filename).expect("Cannot create output file")))
+        }
+        None => Box::new(BufWriter::new(io::stdout())),
+    };
+
+    writeln!(output_writer, "Query\tReference\tDistance").expect("Error writing header");
+
+    if query_genomes.is_empty() || reference_genomes.is_empty() {
+        return;
+    }
+
+    let k = query_sketches[&query_genomes[0]].len();
+
+    for q in query_genomes {
+        let len = query_sketches[q].len();
+        assert!(
+            len == k,
+            "Query sketch length mismatch for {}: got {}, expected {}",
+            q,
+            len,
+            k
+        );
+    }
+
+    for r in reference_genomes {
+        let len = reference_sketches[r].len();
+        assert!(
+            len == k,
+            "Reference sketch length mismatch for {}: got {}, expected {}",
+            r,
+            len,
+            k
+        );
+    }
+
+    let nq = query_genomes.len();
+    let nr = reference_genomes.len();
+
+    let mut query_flat = Vec::<u16>::with_capacity(nq * k);
+    for q in query_genomes {
+        query_flat.extend_from_slice(&query_sketches[q]);
+    }
+
+    let mut reference_flat = Vec::<u16>::with_capacity(nr * k);
+    for r in reference_genomes {
+        reference_flat.extend_from_slice(&reference_sketches[r]);
+    }
+
+    let mut hamming_rect = vec![0.0f32; nq * nr];
+
+    let block_rows = 2048usize.min(nq.max(1));
+    let block_cols = 2048usize.min(nr.max(1));
+
+    pairwise_hamming_rect_multi_gpu_u16(
+        &query_flat,
+        nq,
+        &reference_flat,
+        nr,
+        k,
+        &mut hamming_rect,
+        block_rows,
+        block_cols,
+    )
+    .expect("GPU rectangular Hamming failed");
+
+    for (qi, q_path) in query_genomes.iter().enumerate() {
+        let query_basename = Path::new(q_path)
+            .file_name()
+            .and_then(|os_str| os_str.to_str())
+            .unwrap_or(q_path);
+
+        for (ri, r_path) in reference_genomes.iter().enumerate() {
+            let h = hamming_rect[qi * nr + ri] as f64;
+            let mut distance = compute_distance_from_hamming(h, kmer_size);
+
+            let reference_basename = Path::new(r_path)
+                .file_name()
+                .and_then(|os_str| os_str.to_str())
+                .unwrap_or(r_path);
+
+            if query_basename == reference_basename {
+                distance = 0.0;
+            }
+
+            writeln!(output_writer, "{}\t{}\t{:.6}", q_path, r_path, distance)
+                .expect("Error writing output");
+        }
+    }
+}
+
 /// Runs the pipeline for a given Kmer type and densification type (`dens`).
 ///
 /// - `dens = 0` => `OptDensHashSketch`
@@ -175,6 +287,7 @@ fn write_results<Sig>(
 ///
 /// We instantiate the internal minhash with `S = f32`,
 /// but the returned signature type is `u64` (per your kmerutils implementation).
+#[cfg(not(feature = "cuda"))]
 fn sketching_kmerType<Kmer, F>(
     query_genomes: &[String],
     reference_genomes: &[String],
@@ -220,6 +333,66 @@ fn sketching_kmerType<Kmer, F>(
 
             println!("Performing pairwise comparisons...");
             write_results(
+                output,
+                query_genomes,
+                reference_genomes,
+                &query_sketches,
+                &reference_sketches,
+                kmer_size,
+            );
+        }
+        _ => panic!("Only densification = 0 or 1 are supported!"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn sketching_kmerType<Kmer, F>(
+    query_genomes: &[String],
+    reference_genomes: &[String],
+    sketch_args: &SeqSketcherParams,
+    kmer_hash_fn: F,
+    dens: usize,
+    output: Option<String>,
+    kmer_size: usize,
+) where
+    Kmer: CompressedKmerT + KmerBuilder<Kmer> + Send + Sync,
+    <Kmer as CompressedKmerT>::Val: num::PrimInt + Send + Sync + Debug,
+    KmerGenerator<Kmer>: KmerGenerationPattern<Kmer>,
+    F: Fn(&Kmer) -> <Kmer as CompressedKmerT>::Val + Send + Sync + Copy,
+    OptDensHashSketch<Kmer, f32>: SeqSketcherT<Kmer, Sig = u16>,
+    RevOptDensHashSketch<Kmer, f32>: SeqSketcherT<Kmer, Sig = u16>,
+{
+    match dens {
+        0 => {
+            let sketcher = OptDensHashSketch::<Kmer, f32>::new(sketch_args);
+
+            println!("Sketching query genomes with OptDens...");
+            let query_sketches = sketch_files(query_genomes, &sketcher, kmer_hash_fn);
+
+            println!("Sketching reference genomes with OptDens...");
+            let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
+
+            println!("Performing GPU pairwise comparisons...");
+            write_results_gpu_u16(
+                output,
+                query_genomes,
+                reference_genomes,
+                &query_sketches,
+                &reference_sketches,
+                kmer_size,
+            );
+        }
+        1 => {
+            let sketcher = RevOptDensHashSketch::<Kmer, f32>::new(sketch_args);
+
+            println!("Sketching query genomes with RevOptDens...");
+            let query_sketches = sketch_files(query_genomes, &sketcher, kmer_hash_fn);
+
+            println!("Sketching reference genomes with RevOptDens...");
+            let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
+
+            println!("Performing GPU pairwise comparisons...");
+            write_results_gpu_u16(
                 output,
                 query_genomes,
                 reference_genomes,
