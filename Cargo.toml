@@ -12,6 +12,8 @@ name = "bindash-cuda"
 path = "src/main.rs"
 
 [dependencies]
+zstd = { version = "0.13", features = ["zstdmt"] }
+ryu = "1.0"
 clap = "4.3"
 needletail = "0.6.0"
 rayon = "1.5"

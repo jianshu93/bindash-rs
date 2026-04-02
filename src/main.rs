@@ -27,6 +27,8 @@ use kmerutils::sketching::setsketchert::{
     RevOptDensHashSketch,
     SeqSketcherT, // trait
 };
+use ryu;
+use zstd;
 use std::time::Instant;
 
 #[cfg(not(feature = "cuda"))]
@@ -147,6 +149,26 @@ where
     compute_distance_from_hamming(h, kmer_size)
 }
 
+
+fn make_zstd_output_writer(output: Option<String>) -> Box<dyn Write> {
+    match output {
+        Some(filename) => {
+            let file = File::create(&filename).expect("Cannot create output file");
+            let mut enc = zstd::Encoder::new(file, 0).expect("Cannot create zstd encoder");
+            let zstd_threads = rayon::current_num_threads() as u32;
+            if zstd_threads > 1 {
+                enc.multithread(zstd_threads)
+                    .expect("Cannot enable zstd multithreading");
+            }
+            Box::new(BufWriter::with_capacity(16 << 20, enc.auto_finish()))
+        }
+        None => {
+            panic!("Refusing to write zstd-compressed output to stdout; please provide -o");
+        }
+    }
+}
+
+
 #[cfg(not(feature = "cuda"))]
 fn write_results<Sig>(
     output: Option<String>,
@@ -156,53 +178,122 @@ fn write_results<Sig>(
     reference_sketches: &HashMap<String, Vec<Sig>>,
     kmer_size: usize,
 ) where
-    Sig: Send + Sync,
+    Sig: Send + Sync + Clone,
     DistHamming: Distance<Sig>,
 {
-    let mut output_writer: Box<dyn Write> = match output {
-        Some(filename) => {
-            Box::new(BufWriter::new(File::create(&filename).expect("Cannot create output file")))
-        }
-        None => Box::new(BufWriter::new(io::stdout())),
-    };
+    let total_t0 = Instant::now();
+
+    log::info!(
+        "CPU distance: starting pairwise comparisons for {} query x {} reference = {} pairs",
+        query_genomes.len(),
+        reference_genomes.len(),
+        query_genomes.len() * reference_genomes.len()
+    );
+
+    let mut output_writer = make_zstd_output_writer(output);
 
     writeln!(output_writer, "Query\tReference\tDistance").expect("Error writing header");
 
-    let all_pairs: Vec<(String, String)> = query_genomes
-        .iter()
-        .flat_map(|q| reference_genomes.iter().map(move |r| (q.clone(), r.clone())))
-        .collect();
+    let nq = query_genomes.len();
+    let nr = reference_genomes.len();
 
-    let results: Vec<(String, String, f64)> = all_pairs
+    let block_rows = ((nq as f64).sqrt() as usize).max(1);
+    log::info!(
+        "CPU distance: block-wise zstd writing with block_rows = {} (nq = {})",
+        block_rows,
+        nq
+    );
+
+    let total_pairs = nq * nr;
+    let hamming_t0 = Instant::now();
+
+    let raw_results: Vec<Vec<f32>> = (0..nq)
         .into_par_iter()
-        .map(|(query_path, reference_path)| {
-            let query_signature = &query_sketches[&query_path];
-            let reference_signature = &reference_sketches[&reference_path];
+        .map(|qi| {
+            let q_path = &query_genomes[qi];
+            let query_signature = &query_sketches[q_path];
+            let mut row = Vec::with_capacity(nr);
 
-            let mut distance = compute_distance(query_signature, reference_signature, kmer_size);
-
-            let query_basename = Path::new(&query_path)
-                .file_name()
-                .and_then(|os_str| os_str.to_str())
-                .unwrap_or(&query_path);
-
-            let reference_basename = Path::new(&reference_path)
-                .file_name()
-                .and_then(|os_str| os_str.to_str())
-                .unwrap_or(&reference_path);
-
-            if query_basename == reference_basename {
-                distance = 0.0;
+            for r_path in reference_genomes {
+                let reference_signature = &reference_sketches[r_path];
+                let dist_hamming = DistHamming;
+                let h = dist_hamming.eval(query_signature, reference_signature) as f32;
+                row.push(h);
             }
 
-            (query_path, reference_path, distance)
+            row
         })
         .collect();
 
-    for (q_path, r_path, dist) in results {
-        writeln!(output_writer, "{}\t{}\t{:.6}", q_path, r_path, dist)
-            .expect("Error writing output");
+    log::info!(
+        "CPU distance: raw Hamming stage finished in {:.3}s for {} pairs",
+        hamming_t0.elapsed().as_secs_f64(),
+        total_pairs
+    );
+
+    let write_t0 = Instant::now();
+
+    let mut q0 = 0usize;
+    while q0 < nq {
+        let q1 = (q0 + block_rows).min(nq);
+
+        let lines: Vec<String> = (q0..q1)
+            .into_par_iter()
+            .map(|qi| {
+                let q_path = &query_genomes[qi];
+                let query_basename = Path::new(q_path)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(q_path);
+
+                let mut line_block = String::with_capacity(nr * 64);
+                let row = &raw_results[qi];
+                let mut fmt = ryu::Buffer::new();
+
+                for (ri, r_path) in reference_genomes.iter().enumerate() {
+                    let reference_basename = Path::new(r_path)
+                        .file_name()
+                        .and_then(|os_str| os_str.to_str())
+                        .unwrap_or(r_path);
+
+                    let mut distance =
+                        compute_distance_from_hamming(row[ri] as f64, kmer_size);
+
+                    if query_basename == reference_basename {
+                        distance = 0.0;
+                    }
+
+                    line_block.push_str(q_path);
+                    line_block.push('\t');
+                    line_block.push_str(r_path);
+                    line_block.push('\t');
+                    line_block.push_str(fmt.format_finite(distance));
+                    line_block.push('\n');
+                }
+
+                line_block
+            })
+            .collect();
+
+        for line in &lines {
+            output_writer
+                .write_all(line.as_bytes())
+                .expect("Error writing output block");
+        }
+
+        q0 = q1;
     }
+
+    output_writer.flush().expect("Error flushing output");
+
+    log::info!(
+        "CPU distance: transform + zstd write stage finished in {:.3}s",
+        write_t0.elapsed().as_secs_f64()
+    );
+    log::info!(
+        "CPU distance: total compute + zstd write completed in {:.3}s",
+        total_t0.elapsed().as_secs_f64()
+    );
 }
 
 #[cfg(feature = "cuda")]
@@ -214,16 +305,19 @@ fn write_results_gpu_u16(
     reference_sketches: &HashMap<String, Vec<u16>>,
     kmer_size: usize,
 ) {
-    let mut output_writer: Box<dyn Write> = match output {
-        Some(filename) => {
-            Box::new(BufWriter::new(File::create(&filename).expect("Cannot create output file")))
-        }
-        None => Box::new(BufWriter::new(io::stdout())),
-    };
+    let total_t0 = Instant::now();
+    log::info!(
+        "GPU distance: starting pairwise comparisons for {} query x {} reference = {} pairs",
+        query_genomes.len(),
+        reference_genomes.len(),
+        query_genomes.len() * reference_genomes.len()
+    );
 
+    let mut output_writer = make_zstd_output_writer(output);
     writeln!(output_writer, "Query\tReference\tDistance").expect("Error writing header");
 
     if query_genomes.is_empty() || reference_genomes.is_empty() {
+        log::info!("GPU distance: empty query or reference set, nothing to do");
         return;
     }
 
@@ -254,6 +348,7 @@ fn write_results_gpu_u16(
     let nq = query_genomes.len();
     let nr = reference_genomes.len();
 
+    let flatten_t0 = Instant::now();
     let mut query_flat = Vec::<u16>::with_capacity(nq * k);
     for q in query_genomes {
         query_flat.extend_from_slice(&query_sketches[q]);
@@ -264,11 +359,20 @@ fn write_results_gpu_u16(
         reference_flat.extend_from_slice(&reference_sketches[r]);
     }
 
+    log::info!(
+        "GPU distance: flatten stage finished in {:.3}s (nq={} nr={} k={})",
+        flatten_t0.elapsed().as_secs_f64(),
+        nq,
+        nr,
+        k
+    );
+
     let mut hamming_rect = vec![0.0f32; nq * nr];
 
-    let block_rows = 2048usize.min(nq.max(1));
     let block_cols = 2048usize.min(nr.max(1));
+    let block_rows_gpu = 2048usize.min(nq.max(1));
 
+    let hamming_t0 = Instant::now();
     pairwise_hamming_rect_multi_gpu_u16(
         &query_flat,
         nq,
@@ -276,34 +380,88 @@ fn write_results_gpu_u16(
         nr,
         k,
         &mut hamming_rect,
-        block_rows,
+        block_rows_gpu,
         block_cols,
     )
     .expect("GPU rectangular Hamming failed");
 
-    for (qi, q_path) in query_genomes.iter().enumerate() {
-        let query_basename = Path::new(q_path)
-            .file_name()
-            .and_then(|os_str| os_str.to_str())
-            .unwrap_or(q_path);
+    log::info!(
+        "GPU distance: raw GPU Hamming stage finished in {:.3}s",
+        hamming_t0.elapsed().as_secs_f64()
+    );
 
-        for (ri, r_path) in reference_genomes.iter().enumerate() {
-            let h = hamming_rect[qi * nr + ri] as f64;
-            let mut distance = compute_distance_from_hamming(h, kmer_size);
+    let write_t0 = Instant::now();
 
-            let reference_basename = Path::new(r_path)
-                .file_name()
-                .and_then(|os_str| os_str.to_str())
-                .unwrap_or(r_path);
+    let block_rows_write = ((nq as f64).sqrt() as usize).max(1);
+    log::info!(
+        "GPU distance: block-wise zstd writing with block_rows = {} (nq = {})",
+        block_rows_write,
+        nq
+    );
 
-            if query_basename == reference_basename {
-                distance = 0.0;
-            }
+    let mut q0 = 0usize;
+    while q0 < nq {
+        let q1 = (q0 + block_rows_write).min(nq);
 
-            writeln!(output_writer, "{}\t{}\t{:.6}", q_path, r_path, distance)
-                .expect("Error writing output");
+        let lines: Vec<String> = (q0..q1)
+            .into_par_iter()
+            .map(|qi| {
+                let q_path = &query_genomes[qi];
+                let query_basename = Path::new(q_path)
+                    .file_name()
+                    .and_then(|os_str| os_str.to_str())
+                    .unwrap_or(q_path);
+
+                let mut line_block = String::with_capacity(nr * 64);
+                let row_base = qi * nr;
+                let mut fmt = ryu::Buffer::new();
+
+                for (ri, r_path) in reference_genomes.iter().enumerate() {
+                    let reference_basename = Path::new(r_path)
+                        .file_name()
+                        .and_then(|os_str| os_str.to_str())
+                        .unwrap_or(r_path);
+
+                    let mut distance = compute_distance_from_hamming(
+                        hamming_rect[row_base + ri] as f64,
+                        kmer_size,
+                    );
+
+                    if query_basename == reference_basename {
+                        distance = 0.0;
+                    }
+
+                    line_block.push_str(q_path);
+                    line_block.push('\t');
+                    line_block.push_str(r_path);
+                    line_block.push('\t');
+                    line_block.push_str(fmt.format_finite(distance));
+                    line_block.push('\n');
+                }
+
+                line_block
+            })
+            .collect();
+
+        for line in &lines {
+            output_writer
+                .write_all(line.as_bytes())
+                .expect("Error writing output block");
         }
+
+        q0 = q1;
     }
+
+    output_writer.flush().expect("Error flushing output");
+
+    log::info!(
+        "GPU distance: transform + zstd write stage finished in {:.3}s",
+        write_t0.elapsed().as_secs_f64()
+    );
+    log::info!(
+        "GPU distance: total compute + zstd write completed in {:.3}s",
+        total_t0.elapsed().as_secs_f64()
+    );
 }
 
 /// Runs the pipeline for a given Kmer type and densification type (`dens`).
@@ -549,7 +707,7 @@ fn main() {
                 .short('o')
                 .long("output")
                 .value_name("OUTPUT_FILE")
-                .help("Output file (defaults to stdout)")
+                .help("Output file (zstd-compressed by default)")
                 .required(false)
                 .action(ArgAction::Set),
         )
