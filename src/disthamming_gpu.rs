@@ -11,11 +11,12 @@
 // Distances are stored as f32.
 
 use anyhow::{bail, Context, Result};
-use cudarc::driver::{CudaContext, CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::compile_ptx;
 use log::{debug, info, warn};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 const KERNEL_SRC: &str = r#"
 #ifndef BK16
@@ -175,6 +176,8 @@ fn pairwise_hamming_rect_single_gpu_u16(
     block_cols: usize,
     gpu_id: usize,
 ) -> Result<()> {
+    let total_t0 = Instant::now();
+
     if query_sketches.len() != nq * k {
         bail!(
             "query_sketches length mismatch: got {}, expected {}",
@@ -214,7 +217,8 @@ fn pairwise_hamming_rect_single_gpu_u16(
     }
 
     info!(
-        "single-GPU rect: nq={} nr={} k={} block_rows={} block_cols={} query={:.2} GiB ref={:.2} GiB out={:.2} GiB",
+        "single-GPU rect: starting gpu_id={} nq={} nr={} k={} block_rows={} block_cols={} query={:.2} GiB ref={:.2} GiB out={:.2} GiB",
+        gpu_id,
         nq,
         nr,
         k,
@@ -228,19 +232,25 @@ fn pairwise_hamming_rect_single_gpu_u16(
     let ctx = CudaContext::new(gpu_id)?;
     let stream = ctx.default_stream();
 
+    let compile_t0 = Instant::now();
     let ptx = compile_ptx(KERNEL_SRC)?;
     let module = ctx.load_module(ptx)?;
     let func = module
         .load_function("hamming_rect_u16_packed")
         .context("load function hamming_rect_u16_packed")?;
+    info!(
+        "single-GPU rect: kernel compile/load done in {:.3}s",
+        compile_t0.elapsed().as_secs_f64()
+    );
 
+    let upload_t0 = Instant::now();
     let d_query: CudaSlice<u16> = stream.clone_htod(query_sketches)?;
     let d_ref: CudaSlice<u16> = stream.clone_htod(ref_sketches)?;
-
     info!(
-        "single-GPU rect: uploaded query {:.2} MiB, ref {:.2} MiB",
+        "single-GPU rect: uploaded query {:.2} MiB, ref {:.2} MiB in {:.3}s",
         mib(query_sketches.len() * std::mem::size_of::<u16>()),
-        mib(ref_sketches.len() * std::mem::size_of::<u16>())
+        mib(ref_sketches.len() * std::mem::size_of::<u16>()),
+        upload_t0.elapsed().as_secs_f64()
     );
 
     let max_bw = block_rows.min(nq.max(1));
@@ -258,12 +268,18 @@ fn pairwise_hamming_rect_single_gpu_u16(
 
     let nbq = nq.div_ceil(block_rows);
     let nbr = nr.div_ceil(block_cols);
+    let total_tiles = nbq * nbr;
+    let mut done_tiles = 0usize;
+
+    let kernel_total_t0 = Instant::now();
 
     for bi in 0..nbq {
         let i0 = bi * block_rows;
         let bw = (nq - i0).min(block_rows);
 
         for bj in 0..nbr {
+            let tile_t0 = Instant::now();
+
             let j0 = bj * block_cols;
             let bh = (nr - j0).min(block_cols);
 
@@ -317,8 +333,30 @@ fn pairwise_hamming_rect_single_gpu_u16(
                     }
                 }
             }
+
+            done_tiles += 1;
+            if done_tiles == 1 || done_tiles % 100 == 0 || done_tiles == total_tiles {
+                info!(
+                    "single-GPU rect: completed tile {}/{} in {:.3}s (bw={} bh={})",
+                    done_tiles,
+                    total_tiles,
+                    tile_t0.elapsed().as_secs_f64(),
+                    bw,
+                    bh
+                );
+            }
         }
     }
+
+    info!(
+        "single-GPU rect: all {} tiles completed in {:.3}s",
+        total_tiles,
+        kernel_total_t0.elapsed().as_secs_f64()
+    );
+    info!(
+        "single-GPU rect: total runtime {:.3}s",
+        total_t0.elapsed().as_secs_f64()
+    );
 
     Ok(())
 }
@@ -333,6 +371,8 @@ fn pairwise_hamming_rect_multi_gpu_u16_impl(
     block_rows: usize,
     block_cols: usize,
 ) -> Result<()> {
+    let total_t0 = Instant::now();
+
     if query_sketches.len() != nq * k {
         bail!(
             "query_sketches length mismatch: got {}, expected {}",
@@ -400,11 +440,26 @@ fn pairwise_hamming_rect_multi_gpu_u16_impl(
     }
 
     info!(
-        "multi-GPU rect: ng={} nq={} nr={} k={} block_rows={} block_cols={} tiles={}",
-        ng, nq, nr, k, block_rows, block_cols, tiles.len()
+        "multi-GPU rect: starting ng={} nq={} nr={} k={} block_rows={} block_cols={} tiles={} query={:.2} GiB ref={:.2} GiB out={:.2} GiB",
+        ng,
+        nq,
+        nr,
+        k,
+        block_rows,
+        block_cols,
+        tiles.len(),
+        gib(query_sketches.len() * std::mem::size_of::<u16>()),
+        gib(ref_sketches.len() * std::mem::size_of::<u16>()),
+        gib(out.len() * std::mem::size_of::<f32>())
     );
 
+    let compile_t0 = Instant::now();
     let ptx = Arc::new(compile_ptx(KERNEL_SRC)?);
+    info!(
+        "multi-GPU rect: PTX compiled in {:.3}s",
+        compile_t0.elapsed().as_secs_f64()
+    );
+
     let tiles = Arc::new(tiles);
     let next = Arc::new(AtomicUsize::new(0));
 
@@ -412,6 +467,7 @@ fn pairwise_hamming_rect_multi_gpu_u16_impl(
     let r_arc: Arc<Vec<u16>> = Arc::new(ref_sketches.to_vec());
 
     let out_addr = out.as_mut_ptr() as usize;
+    let total_tiles = tiles.len();
 
     std::thread::scope(|scope| {
         for dev_id in 0..ng {
@@ -422,7 +478,11 @@ fn pairwise_hamming_rect_multi_gpu_u16_impl(
             let r_arc = Arc::clone(&r_arc);
 
             scope.spawn(move || {
+                let worker_t0 = Instant::now();
+
                 let inner = || -> Result<()> {
+                    info!("multi-GPU rect: dev {} worker starting", dev_id);
+
                     let ctx = CudaContext::new(dev_id)?;
                     let stream = ctx.default_stream();
 
@@ -431,8 +491,14 @@ fn pairwise_hamming_rect_multi_gpu_u16_impl(
                         .load_function("hamming_rect_u16_packed")
                         .context("load function hamming_rect_u16_packed")?;
 
+                    let upload_t0 = Instant::now();
                     let d_query: CudaSlice<u16> = stream.clone_htod(&q_arc[..])?;
                     let d_ref: CudaSlice<u16> = stream.clone_htod(&r_arc[..])?;
+                    info!(
+                        "multi-GPU rect: dev {} uploaded query/ref in {:.3}s",
+                        dev_id,
+                        upload_t0.elapsed().as_secs_f64()
+                    );
 
                     let max_bw = block_rows.min(nq.max(1));
                     let max_bh = block_cols.min(nr.max(1));
@@ -444,12 +510,15 @@ fn pairwise_hamming_rect_multi_gpu_u16_impl(
                     let nr_i32 = nr as i32;
                     let k_i32 = k as i32;
 
+                    let mut worker_tiles = 0usize;
+
                     loop {
                         let tix = next.fetch_add(1, Ordering::Relaxed);
                         if tix >= tiles.len() {
                             break;
                         }
 
+                        let tile_t0 = Instant::now();
                         let (bi, bj) = tiles[tix];
 
                         let i0 = bi * block_rows;
@@ -502,7 +571,28 @@ fn pairwise_hamming_rect_multi_gpu_u16_impl(
                                 }
                             }
                         }
+
+                        worker_tiles += 1;
+                        if worker_tiles == 1 || worker_tiles % 100 == 0 || tix + 1 == total_tiles {
+                            info!(
+                                "multi-GPU rect: dev {} completed worker_tile={} global_tile={}/{} in {:.3}s (bw={} bh={})",
+                                dev_id,
+                                worker_tiles,
+                                tix + 1,
+                                total_tiles,
+                                tile_t0.elapsed().as_secs_f64(),
+                                bw,
+                                bh
+                            );
+                        }
                     }
+
+                    info!(
+                        "multi-GPU rect: dev {} worker finished {} tiles in {:.3}s",
+                        dev_id,
+                        worker_tiles,
+                        worker_t0.elapsed().as_secs_f64()
+                    );
 
                     Ok(())
                 };
@@ -513,6 +603,11 @@ fn pairwise_hamming_rect_multi_gpu_u16_impl(
             });
         }
     });
+
+    info!(
+        "multi-GPU rect: all workers finished in {:.3}s",
+        total_t0.elapsed().as_secs_f64()
+    );
 
     Ok(())
 }

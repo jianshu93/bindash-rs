@@ -27,6 +27,7 @@ use kmerutils::sketching::setsketchert::{
     RevOptDensHashSketch,
     SeqSketcherT, // trait
 };
+use std::time::Instant;
 
 #[cfg(not(feature = "cuda"))]
 use anndists::dist::{Distance, DistHamming};
@@ -69,9 +70,21 @@ where
     <Sketcher as SeqSketcherT<Kmer>>::Sig: Send + Sync + Clone,
     F: Fn(&Kmer) -> <Kmer as CompressedKmerT>::Val + Send + Sync + Copy,
 {
-    file_paths
+    let t0 = Instant::now();
+    log::info!(
+        "sketch_files: starting sketch of {} files with k={} sketch_size={} algo={:?}",
+        file_paths.len(),
+        sketcher.get_kmer_size(),
+        sketcher.get_sketch_size(),
+        sketcher.get_algo()
+    );
+
+    let out: HashMap<String, Vec<<Sketcher as SeqSketcherT<Kmer>>::Sig>> = file_paths
         .par_iter()
         .map(|path| {
+            let file_t0 = Instant::now();
+            log::debug!("sketch_files: start {}", path);
+
             let mut sequences = Vec::new();
             let mut reader = parse_fastx_file(path).expect("Invalid FASTA/Q file");
 
@@ -84,12 +97,25 @@ where
 
             let sequences_ref: Vec<&SequenceStruct> = sequences.iter().collect();
 
-            // Vec<Vec<Sig>>, inner vec has size 1
             let signature = sketcher.sketch_compressedkmer_seqs(&sequences_ref, kmer_hash_fn);
+
+            log::debug!(
+                "sketch_files: finished {} in {:.3}s",
+                path,
+                file_t0.elapsed().as_secs_f64()
+            );
 
             (path.clone(), signature[0].clone())
         })
-        .collect()
+        .collect();
+
+    log::info!(
+        "sketch_files: finished {} files in {:.3}s",
+        file_paths.len(),
+        t0.elapsed().as_secs_f64()
+    );
+
+    out
 }
 
 /// Computes the distance between two sketches (as `Vec<u64>`) using DistHamming,
@@ -302,16 +328,28 @@ fn sketching_kmerType<Kmer, F>(
     KmerGenerator<Kmer>: KmerGenerationPattern<Kmer>,
     F: Fn(&Kmer) -> <Kmer as CompressedKmerT>::Val + Send + Sync + Copy,
 {
+    let total_t0 = Instant::now();
+    log::info!(
+        "pipeline(CPU): starting with {} query genomes and {} reference genomes",
+        query_genomes.len(),
+        reference_genomes.len()
+    );
+
     match dens {
         0 => {
             let sketcher = OptDensHashSketch::<Kmer, f32>::new(sketch_args);
 
+            let tq = Instant::now();
             println!("Sketching query genomes with OptDens...");
             let query_sketches = sketch_files(query_genomes, &sketcher, kmer_hash_fn);
+            log::info!("pipeline(CPU): query sketching finished in {:.3}s", tq.elapsed().as_secs_f64());
 
+            let tr = Instant::now();
             println!("Sketching reference genomes with OptDens...");
             let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
+            log::info!("pipeline(CPU): reference sketching finished in {:.3}s", tr.elapsed().as_secs_f64());
 
+            let td = Instant::now();
             println!("Performing pairwise comparisons...");
             write_results(
                 output,
@@ -321,16 +359,22 @@ fn sketching_kmerType<Kmer, F>(
                 &reference_sketches,
                 kmer_size,
             );
+            log::info!("pipeline(CPU): distance stage finished in {:.3}s", td.elapsed().as_secs_f64());
         }
         1 => {
             let sketcher = RevOptDensHashSketch::<Kmer, f32>::new(sketch_args);
 
+            let tq = Instant::now();
             println!("Sketching query genomes with RevOptDens...");
             let query_sketches = sketch_files(query_genomes, &sketcher, kmer_hash_fn);
+            log::info!("pipeline(CPU): query sketching finished in {:.3}s", tq.elapsed().as_secs_f64());
 
+            let tr = Instant::now();
             println!("Sketching reference genomes with RevOptDens...");
             let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
+            log::info!("pipeline(CPU): reference sketching finished in {:.3}s", tr.elapsed().as_secs_f64());
 
+            let td = Instant::now();
             println!("Performing pairwise comparisons...");
             write_results(
                 output,
@@ -340,9 +384,15 @@ fn sketching_kmerType<Kmer, F>(
                 &reference_sketches,
                 kmer_size,
             );
+            log::info!("pipeline(CPU): distance stage finished in {:.3}s", td.elapsed().as_secs_f64());
         }
         _ => panic!("Only densification = 0 or 1 are supported!"),
     }
+
+    log::info!(
+        "pipeline(CPU): total runtime {:.3}s",
+        total_t0.elapsed().as_secs_f64()
+    );
 }
 
 #[cfg(feature = "cuda")]
@@ -362,16 +412,28 @@ fn sketching_kmerType<Kmer, F>(
     OptDensHashSketch<Kmer, f32>: SeqSketcherT<Kmer, Sig = u16>,
     RevOptDensHashSketch<Kmer, f32>: SeqSketcherT<Kmer, Sig = u16>,
 {
+    let total_t0 = Instant::now();
+    log::info!(
+        "pipeline(GPU): starting with {} query genomes and {} reference genomes",
+        query_genomes.len(),
+        reference_genomes.len()
+    );
+
     match dens {
         0 => {
             let sketcher = OptDensHashSketch::<Kmer, f32>::new(sketch_args);
 
+            let tq = Instant::now();
             println!("Sketching query genomes with OptDens...");
             let query_sketches = sketch_files(query_genomes, &sketcher, kmer_hash_fn);
+            log::info!("pipeline(GPU): query sketching finished in {:.3}s", tq.elapsed().as_secs_f64());
 
+            let tr = Instant::now();
             println!("Sketching reference genomes with OptDens...");
             let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
+            log::info!("pipeline(GPU): reference sketching finished in {:.3}s", tr.elapsed().as_secs_f64());
 
+            let td = Instant::now();
             println!("Performing GPU pairwise comparisons...");
             write_results_gpu_u16(
                 output,
@@ -381,16 +443,22 @@ fn sketching_kmerType<Kmer, F>(
                 &reference_sketches,
                 kmer_size,
             );
+            log::info!("pipeline(GPU): distance stage finished in {:.3}s", td.elapsed().as_secs_f64());
         }
         1 => {
             let sketcher = RevOptDensHashSketch::<Kmer, f32>::new(sketch_args);
 
+            let tq = Instant::now();
             println!("Sketching query genomes with RevOptDens...");
             let query_sketches = sketch_files(query_genomes, &sketcher, kmer_hash_fn);
+            log::info!("pipeline(GPU): query sketching finished in {:.3}s", tq.elapsed().as_secs_f64());
 
+            let tr = Instant::now();
             println!("Sketching reference genomes with RevOptDens...");
             let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
+            log::info!("pipeline(GPU): reference sketching finished in {:.3}s", tr.elapsed().as_secs_f64());
 
+            let td = Instant::now();
             println!("Performing GPU pairwise comparisons...");
             write_results_gpu_u16(
                 output,
@@ -400,9 +468,15 @@ fn sketching_kmerType<Kmer, F>(
                 &reference_sketches,
                 kmer_size,
             );
+            log::info!("pipeline(GPU): distance stage finished in {:.3}s", td.elapsed().as_secs_f64());
         }
         _ => panic!("Only densification = 0 or 1 are supported!"),
     }
+
+    log::info!(
+        "pipeline(GPU): total runtime {:.3}s",
+        total_t0.elapsed().as_secs_f64()
+    );
 }
 
 fn main() {
@@ -495,6 +569,17 @@ fn main() {
     let threads = *matches.get_one::<usize>("threads").unwrap();
     let output = matches.get_one::<String>("output").cloned();
 
+    log::info!(
+        "main: query_list={} reference_list={} kmer_size={} sketch_size={} dens={} threads={} output={:?}",
+        query_list,
+        reference_list,
+        kmer_size,
+        sketch_size,
+        dens,
+        threads,
+        output
+    );
+
     ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()
@@ -502,6 +587,11 @@ fn main() {
 
     let query_genomes = read_genome_list(&query_list);
     let reference_genomes = read_genome_list(&reference_list);
+    log::info!(
+        "main: loaded {} query genomes and {} reference genomes",
+        query_genomes.len(),
+        reference_genomes.len()
+    );
 
     let sketch_args = SeqSketcherParams::new(
         kmer_size,
