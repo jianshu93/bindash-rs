@@ -172,6 +172,7 @@ fn make_zstd_output_writer(output: Option<String>) -> Box<dyn Write> {
 #[cfg(not(feature = "cuda"))]
 fn write_results<Sig>(
     output: Option<String>,
+    matrix_output: bool,
     query_genomes: &[String],
     reference_genomes: &[String],
     query_sketches: &HashMap<String, Vec<Sig>>,
@@ -192,16 +193,15 @@ fn write_results<Sig>(
 
     let mut output_writer = make_zstd_output_writer(output);
 
-    writeln!(output_writer, "Query\tReference\tDistance").expect("Error writing header");
-
     let nq = query_genomes.len();
     let nr = reference_genomes.len();
 
     let block_rows = ((nq as f64).sqrt() as usize).max(1);
     log::info!(
-        "CPU distance: block-wise zstd writing with block_rows = {} (nq = {})",
+        "CPU distance: block-wise zstd writing with block_rows = {} (nq = {}, matrix_output = {})",
         block_rows,
-        nq
+        nq,
+        matrix_output
     );
 
     let total_pairs = nq * nr;
@@ -233,55 +233,120 @@ fn write_results<Sig>(
 
     let write_t0 = Instant::now();
 
-    let mut q0 = 0usize;
-    while q0 < nq {
-        let q1 = (q0 + block_rows).min(nq);
+    if matrix_output {
+        let mut header = String::with_capacity(nr * 32);
+        header.push_str("ID");
+        for r_path in reference_genomes {
+            header.push('\t');
+            header.push_str(r_path);
+        }
+        header.push('\n');
+        output_writer
+            .write_all(header.as_bytes())
+            .expect("Error writing matrix header");
 
-        let lines: Vec<String> = (q0..q1)
-            .into_par_iter()
-            .map(|qi| {
-                let q_path = &query_genomes[qi];
-                let query_basename = Path::new(q_path)
-                    .file_name()
-                    .and_then(|os_str| os_str.to_str())
-                    .unwrap_or(q_path);
+        let mut q0 = 0usize;
+        while q0 < nq {
+            let q1 = (q0 + block_rows).min(nq);
 
-                let mut line_block = String::with_capacity(nr * 64);
-                let row = &raw_results[qi];
-                let mut fmt = ryu::Buffer::new();
-
-                for (ri, r_path) in reference_genomes.iter().enumerate() {
-                    let reference_basename = Path::new(r_path)
+            let lines: Vec<String> = (q0..q1)
+                .into_par_iter()
+                .map(|qi| {
+                    let q_path = &query_genomes[qi];
+                    let query_basename = Path::new(q_path)
                         .file_name()
                         .and_then(|os_str| os_str.to_str())
-                        .unwrap_or(r_path);
+                        .unwrap_or(q_path);
 
-                    let mut distance =
-                        compute_distance_from_hamming(row[ri] as f64, kmer_size);
+                    let mut line = String::with_capacity(nr * 16 + q_path.len() + 1);
+                    let row = &raw_results[qi];
+                    let mut fmt = ryu::Buffer::new();
 
-                    if query_basename == reference_basename {
-                        distance = 0.0;
+                    line.push_str(q_path);
+
+                    for (ri, r_path) in reference_genomes.iter().enumerate() {
+                        let reference_basename = Path::new(r_path)
+                            .file_name()
+                            .and_then(|os_str| os_str.to_str())
+                            .unwrap_or(r_path);
+
+                        let mut distance =
+                            compute_distance_from_hamming(row[ri] as f64, kmer_size);
+
+                        if query_basename == reference_basename {
+                            distance = 0.0;
+                        }
+
+                        line.push('\t');
+                        line.push_str(fmt.format_finite(distance));
                     }
 
-                    line_block.push_str(q_path);
-                    line_block.push('\t');
-                    line_block.push_str(r_path);
-                    line_block.push('\t');
-                    line_block.push_str(fmt.format_finite(distance));
-                    line_block.push('\n');
-                }
+                    line.push('\n');
+                    line
+                })
+                .collect();
 
-                line_block
-            })
-            .collect();
+            for line in &lines {
+                output_writer
+                    .write_all(line.as_bytes())
+                    .expect("Error writing matrix row block");
+            }
 
-        for line in &lines {
-            output_writer
-                .write_all(line.as_bytes())
-                .expect("Error writing output block");
+            q0 = q1;
         }
+    } else {
+        writeln!(output_writer, "Query\tReference\tDistance").expect("Error writing header");
 
-        q0 = q1;
+        let mut q0 = 0usize;
+        while q0 < nq {
+            let q1 = (q0 + block_rows).min(nq);
+
+            let lines: Vec<String> = (q0..q1)
+                .into_par_iter()
+                .map(|qi| {
+                    let q_path = &query_genomes[qi];
+                    let query_basename = Path::new(q_path)
+                        .file_name()
+                        .and_then(|os_str| os_str.to_str())
+                        .unwrap_or(q_path);
+
+                    let mut line_block = String::with_capacity(nr * 64);
+                    let row = &raw_results[qi];
+                    let mut fmt = ryu::Buffer::new();
+
+                    for (ri, r_path) in reference_genomes.iter().enumerate() {
+                        let reference_basename = Path::new(r_path)
+                            .file_name()
+                            .and_then(|os_str| os_str.to_str())
+                            .unwrap_or(r_path);
+
+                        let mut distance =
+                            compute_distance_from_hamming(row[ri] as f64, kmer_size);
+
+                        if query_basename == reference_basename {
+                            distance = 0.0;
+                        }
+
+                        line_block.push_str(q_path);
+                        line_block.push('\t');
+                        line_block.push_str(r_path);
+                        line_block.push('\t');
+                        line_block.push_str(fmt.format_finite(distance));
+                        line_block.push('\n');
+                    }
+
+                    line_block
+                })
+                .collect();
+
+            for line in &lines {
+                output_writer
+                    .write_all(line.as_bytes())
+                    .expect("Error writing output block");
+            }
+
+            q0 = q1;
+        }
     }
 
     output_writer.flush().expect("Error flushing output");
@@ -299,6 +364,7 @@ fn write_results<Sig>(
 #[cfg(feature = "cuda")]
 fn write_results_gpu_u16(
     output: Option<String>,
+    matrix_output: bool,
     query_genomes: &[String],
     reference_genomes: &[String],
     query_sketches: &HashMap<String, Vec<u16>>,
@@ -314,7 +380,6 @@ fn write_results_gpu_u16(
     );
 
     let mut output_writer = make_zstd_output_writer(output);
-    writeln!(output_writer, "Query\tReference\tDistance").expect("Error writing header");
 
     if query_genomes.is_empty() || reference_genomes.is_empty() {
         log::info!("GPU distance: empty query or reference set, nothing to do");
@@ -394,62 +459,130 @@ fn write_results_gpu_u16(
 
     let block_rows_write = ((nq as f64).sqrt() as usize).max(1);
     log::info!(
-        "GPU distance: block-wise zstd writing with block_rows = {} (nq = {})",
+        "GPU distance: block-wise zstd writing with block_rows = {} (nq = {}, matrix_output = {})",
         block_rows_write,
-        nq
+        nq,
+        matrix_output
     );
 
-    let mut q0 = 0usize;
-    while q0 < nq {
-        let q1 = (q0 + block_rows_write).min(nq);
+    if matrix_output {
+        let mut header = String::with_capacity(nr * 32);
+        header.push_str("ID");
+        for r_path in reference_genomes {
+            header.push('\t');
+            header.push_str(r_path);
+        }
+        header.push('\n');
+        output_writer
+            .write_all(header.as_bytes())
+            .expect("Error writing matrix header");
 
-        let lines: Vec<String> = (q0..q1)
-            .into_par_iter()
-            .map(|qi| {
-                let q_path = &query_genomes[qi];
-                let query_basename = Path::new(q_path)
-                    .file_name()
-                    .and_then(|os_str| os_str.to_str())
-                    .unwrap_or(q_path);
+        let mut q0 = 0usize;
+        while q0 < nq {
+            let q1 = (q0 + block_rows_write).min(nq);
 
-                let mut line_block = String::with_capacity(nr * 64);
-                let row_base = qi * nr;
-                let mut fmt = ryu::Buffer::new();
-
-                for (ri, r_path) in reference_genomes.iter().enumerate() {
-                    let reference_basename = Path::new(r_path)
+            let lines: Vec<String> = (q0..q1)
+                .into_par_iter()
+                .map(|qi| {
+                    let q_path = &query_genomes[qi];
+                    let query_basename = Path::new(q_path)
                         .file_name()
                         .and_then(|os_str| os_str.to_str())
-                        .unwrap_or(r_path);
+                        .unwrap_or(q_path);
 
-                    let mut distance = compute_distance_from_hamming(
-                        hamming_rect[row_base + ri] as f64,
-                        kmer_size,
-                    );
+                    let mut line = String::with_capacity(nr * 16 + q_path.len() + 1);
+                    let row_base = qi * nr;
+                    let mut fmt = ryu::Buffer::new();
 
-                    if query_basename == reference_basename {
-                        distance = 0.0;
+                    line.push_str(q_path);
+
+                    for (ri, r_path) in reference_genomes.iter().enumerate() {
+                        let reference_basename = Path::new(r_path)
+                            .file_name()
+                            .and_then(|os_str| os_str.to_str())
+                            .unwrap_or(r_path);
+
+                        let mut distance = compute_distance_from_hamming(
+                            hamming_rect[row_base + ri] as f64,
+                            kmer_size,
+                        );
+
+                        if query_basename == reference_basename {
+                            distance = 0.0;
+                        }
+
+                        line.push('\t');
+                        line.push_str(fmt.format_finite(distance));
                     }
 
-                    line_block.push_str(q_path);
-                    line_block.push('\t');
-                    line_block.push_str(r_path);
-                    line_block.push('\t');
-                    line_block.push_str(fmt.format_finite(distance));
-                    line_block.push('\n');
-                }
+                    line.push('\n');
+                    line
+                })
+                .collect();
 
-                line_block
-            })
-            .collect();
+            for line in &lines {
+                output_writer
+                    .write_all(line.as_bytes())
+                    .expect("Error writing matrix row block");
+            }
 
-        for line in &lines {
-            output_writer
-                .write_all(line.as_bytes())
-                .expect("Error writing output block");
+            q0 = q1;
         }
+    } else {
+        writeln!(output_writer, "Query\tReference\tDistance").expect("Error writing header");
 
-        q0 = q1;
+        let mut q0 = 0usize;
+        while q0 < nq {
+            let q1 = (q0 + block_rows_write).min(nq);
+
+            let lines: Vec<String> = (q0..q1)
+                .into_par_iter()
+                .map(|qi| {
+                    let q_path = &query_genomes[qi];
+                    let query_basename = Path::new(q_path)
+                        .file_name()
+                        .and_then(|os_str| os_str.to_str())
+                        .unwrap_or(q_path);
+
+                    let mut line_block = String::with_capacity(nr * 64);
+                    let row_base = qi * nr;
+                    let mut fmt = ryu::Buffer::new();
+
+                    for (ri, r_path) in reference_genomes.iter().enumerate() {
+                        let reference_basename = Path::new(r_path)
+                            .file_name()
+                            .and_then(|os_str| os_str.to_str())
+                            .unwrap_or(r_path);
+
+                        let mut distance = compute_distance_from_hamming(
+                            hamming_rect[row_base + ri] as f64,
+                            kmer_size,
+                        );
+
+                        if query_basename == reference_basename {
+                            distance = 0.0;
+                        }
+
+                        line_block.push_str(q_path);
+                        line_block.push('\t');
+                        line_block.push_str(r_path);
+                        line_block.push('\t');
+                        line_block.push_str(fmt.format_finite(distance));
+                        line_block.push('\n');
+                    }
+
+                    line_block
+                })
+                .collect();
+
+            for line in &lines {
+                output_writer
+                    .write_all(line.as_bytes())
+                    .expect("Error writing output block");
+            }
+
+            q0 = q1;
+        }
     }
 
     output_writer.flush().expect("Error flushing output");
@@ -479,6 +612,7 @@ fn sketching_kmerType<Kmer, F>(
     kmer_hash_fn: F,
     dens: usize,
     output: Option<String>,
+    matrix_output: bool,
     kmer_size: usize,
 ) where
     Kmer: CompressedKmerT + KmerBuilder<Kmer> + Send + Sync,
@@ -511,6 +645,7 @@ fn sketching_kmerType<Kmer, F>(
             println!("Performing pairwise comparisons...");
             write_results(
                 output,
+                matrix_output,
                 query_genomes,
                 reference_genomes,
                 &query_sketches,
@@ -536,6 +671,7 @@ fn sketching_kmerType<Kmer, F>(
             println!("Performing pairwise comparisons...");
             write_results(
                 output,
+                matrix_output,
                 query_genomes,
                 reference_genomes,
                 &query_sketches,
@@ -561,6 +697,7 @@ fn sketching_kmerType<Kmer, F>(
     kmer_hash_fn: F,
     dens: usize,
     output: Option<String>,
+    matrix_output: bool,
     kmer_size: usize,
 ) where
     Kmer: CompressedKmerT + KmerBuilder<Kmer> + Send + Sync,
@@ -595,6 +732,7 @@ fn sketching_kmerType<Kmer, F>(
             println!("Performing GPU pairwise comparisons...");
             write_results_gpu_u16(
                 output,
+                matrix_output,
                 query_genomes,
                 reference_genomes,
                 &query_sketches,
@@ -620,6 +758,7 @@ fn sketching_kmerType<Kmer, F>(
             println!("Performing GPU pairwise comparisons...");
             write_results_gpu_u16(
                 output,
+                matrix_output,
                 query_genomes,
                 reference_genomes,
                 &query_sketches,
@@ -703,6 +842,12 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
+            Arg::new("matrix")
+                .long("matrix")
+                .help("Write dense rectangular matrix output")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("output")
                 .short('o')
                 .long("output")
@@ -725,17 +870,19 @@ fn main() {
     let sketch_size = *matches.get_one::<usize>("sketch_size").unwrap();
     let dens = *matches.get_one::<usize>("dens_opt").unwrap();
     let threads = *matches.get_one::<usize>("threads").unwrap();
+    let matrix_output = matches.get_flag("matrix");
     let output = matches.get_one::<String>("output").cloned();
 
     log::info!(
-        "main: query_list={} reference_list={} kmer_size={} sketch_size={} dens={} threads={} output={:?}",
+        "main: query_list={} reference_list={} kmer_size={} sketch_size={} dens={} threads={} output={:?} matrix_output={}",
         query_list,
         reference_list,
         kmer_size,
         sketch_size,
         dens,
         threads,
-        output
+        output,
+        matrix_output
     );
 
     ThreadPoolBuilder::new()
@@ -774,6 +921,7 @@ fn main() {
             kmer_hash_fn_32bit,
             dens,
             output,
+            matrix_output,
             kmer_size,
         );
     } else if kmer_size == 16 {
@@ -796,6 +944,7 @@ fn main() {
             kmer_hash_fn_16b32bit,
             dens,
             output,
+            matrix_output,
             kmer_size,
         );
     } else if kmer_size <= 32 {
@@ -815,6 +964,7 @@ fn main() {
             kmer_hash_fn_64bit,
             dens,
             output,
+            matrix_output,
             kmer_size,
         );
     } else {
