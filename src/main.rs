@@ -173,6 +173,7 @@ fn make_zstd_output_writer(output: Option<String>) -> Box<dyn Write> {
 fn write_results<Sig>(
     output: Option<String>,
     matrix_output: bool,
+    self_compare: bool,
     query_genomes: &[String],
     reference_genomes: &[String],
     query_sketches: &HashMap<String, Vec<Sig>>,
@@ -214,7 +215,12 @@ fn write_results<Sig>(
             let query_signature = &query_sketches[q_path];
             let mut row = Vec::with_capacity(nr);
 
-            for r_path in reference_genomes {
+            for (ri, r_path) in reference_genomes.iter().enumerate() {
+                if self_compare && ri < qi {
+                    row.push(f32::NAN);
+                    continue;
+                }
+
                 let reference_signature = &reference_sketches[r_path];
                 let dist_hamming = DistHamming;
                 let h = dist_hamming.eval(query_signature, reference_signature) as f32;
@@ -253,27 +259,22 @@ fn write_results<Sig>(
                 .into_par_iter()
                 .map(|qi| {
                     let q_path = &query_genomes[qi];
-                    let query_basename = Path::new(q_path)
-                        .file_name()
-                        .and_then(|os_str| os_str.to_str())
-                        .unwrap_or(q_path);
-
                     let mut line = String::with_capacity(nr * 16 + q_path.len() + 1);
                     let row = &raw_results[qi];
                     let mut fmt = ryu::Buffer::new();
 
                     line.push_str(q_path);
 
-                    for (ri, r_path) in reference_genomes.iter().enumerate() {
-                        let reference_basename = Path::new(r_path)
-                            .file_name()
-                            .and_then(|os_str| os_str.to_str())
-                            .unwrap_or(r_path);
+                    for (ri, _r_path) in reference_genomes.iter().enumerate() {
+                        if self_compare && ri < qi {
+                            line.push('\t');
+                            continue;
+                        }
 
                         let mut distance =
                             compute_distance_from_hamming(row[ri] as f64, kmer_size);
 
-                        if query_basename == reference_basename {
+                        if self_compare && ri == qi {
                             distance = 0.0;
                         }
 
@@ -305,25 +306,19 @@ fn write_results<Sig>(
                 .into_par_iter()
                 .map(|qi| {
                     let q_path = &query_genomes[qi];
-                    let query_basename = Path::new(q_path)
-                        .file_name()
-                        .and_then(|os_str| os_str.to_str())
-                        .unwrap_or(q_path);
-
                     let mut line_block = String::with_capacity(nr * 64);
                     let row = &raw_results[qi];
                     let mut fmt = ryu::Buffer::new();
 
                     for (ri, r_path) in reference_genomes.iter().enumerate() {
-                        let reference_basename = Path::new(r_path)
-                            .file_name()
-                            .and_then(|os_str| os_str.to_str())
-                            .unwrap_or(r_path);
+                        if self_compare && ri < qi {
+                            continue;
+                        }
 
                         let mut distance =
                             compute_distance_from_hamming(row[ri] as f64, kmer_size);
 
-                        if query_basename == reference_basename {
+                        if self_compare && ri == qi {
                             distance = 0.0;
                         }
 
@@ -365,6 +360,7 @@ fn write_results<Sig>(
 fn write_results_gpu_u16(
     output: Option<String>,
     matrix_output: bool,
+    self_compare: bool,
     query_genomes: &[String],
     reference_genomes: &[String],
     query_sketches: &HashMap<String, Vec<u16>>,
@@ -485,29 +481,24 @@ fn write_results_gpu_u16(
                 .into_par_iter()
                 .map(|qi| {
                     let q_path = &query_genomes[qi];
-                    let query_basename = Path::new(q_path)
-                        .file_name()
-                        .and_then(|os_str| os_str.to_str())
-                        .unwrap_or(q_path);
-
                     let mut line = String::with_capacity(nr * 16 + q_path.len() + 1);
                     let row_base = qi * nr;
                     let mut fmt = ryu::Buffer::new();
 
                     line.push_str(q_path);
 
-                    for (ri, r_path) in reference_genomes.iter().enumerate() {
-                        let reference_basename = Path::new(r_path)
-                            .file_name()
-                            .and_then(|os_str| os_str.to_str())
-                            .unwrap_or(r_path);
+                    for (ri, _r_path) in reference_genomes.iter().enumerate() {
+                        if self_compare && ri < qi {
+                            line.push('\t');
+                            continue;
+                        }
 
                         let mut distance = compute_distance_from_hamming(
                             hamming_rect[row_base + ri] as f64,
                             kmer_size,
                         );
 
-                        if query_basename == reference_basename {
+                        if self_compare && ri == qi {
                             distance = 0.0;
                         }
 
@@ -539,27 +530,21 @@ fn write_results_gpu_u16(
                 .into_par_iter()
                 .map(|qi| {
                     let q_path = &query_genomes[qi];
-                    let query_basename = Path::new(q_path)
-                        .file_name()
-                        .and_then(|os_str| os_str.to_str())
-                        .unwrap_or(q_path);
-
                     let mut line_block = String::with_capacity(nr * 64);
                     let row_base = qi * nr;
                     let mut fmt = ryu::Buffer::new();
 
                     for (ri, r_path) in reference_genomes.iter().enumerate() {
-                        let reference_basename = Path::new(r_path)
-                            .file_name()
-                            .and_then(|os_str| os_str.to_str())
-                            .unwrap_or(r_path);
+                        if self_compare && ri < qi {
+                            continue;
+                        }
 
                         let mut distance = compute_distance_from_hamming(
                             hamming_rect[row_base + ri] as f64,
                             kmer_size,
                         );
 
-                        if query_basename == reference_basename {
+                        if self_compare && ri == qi {
                             distance = 0.0;
                         }
 
@@ -608,6 +593,7 @@ fn write_results_gpu_u16(
 fn sketching_kmerType<Kmer, F>(
     query_genomes: &[String],
     reference_genomes: &[String],
+    self_compare: bool,
     sketch_args: &SeqSketcherParams,
     kmer_hash_fn: F,
     dens: usize,
@@ -634,24 +620,46 @@ fn sketching_kmerType<Kmer, F>(
             let tq = Instant::now();
             println!("Sketching query genomes with OptDens...");
             let query_sketches = sketch_files(query_genomes, &sketcher, kmer_hash_fn);
-            log::info!("pipeline(CPU): query sketching finished in {:.3}s", tq.elapsed().as_secs_f64());
-
-            let tr = Instant::now();
-            println!("Sketching reference genomes with OptDens...");
-            let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
-            log::info!("pipeline(CPU): reference sketching finished in {:.3}s", tr.elapsed().as_secs_f64());
+            log::info!(
+                "pipeline(CPU): query sketching finished in {:.3}s",
+                tq.elapsed().as_secs_f64()
+            );
 
             let td = Instant::now();
             println!("Performing pairwise comparisons...");
-            write_results(
-                output,
-                matrix_output,
-                query_genomes,
-                reference_genomes,
-                &query_sketches,
-                &reference_sketches,
-                kmer_size,
-            );
+
+            if self_compare {
+                log::info!("pipeline(CPU): self-comparison mode, reusing query sketches as reference sketches");
+                write_results(
+                    output,
+                    matrix_output,
+                    true,
+                    query_genomes,
+                    reference_genomes,
+                    &query_sketches,
+                    &query_sketches,
+                    kmer_size,
+                );
+            } else {
+                let tr = Instant::now();
+                println!("Sketching reference genomes with OptDens...");
+                let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
+                log::info!(
+                    "pipeline(CPU): reference sketching finished in {:.3}s",
+                    tr.elapsed().as_secs_f64()
+                );
+
+                write_results(
+                    output,
+                    matrix_output,
+                    false,
+                    query_genomes,
+                    reference_genomes,
+                    &query_sketches,
+                    &reference_sketches,
+                    kmer_size,
+                );
+            }
             log::info!("pipeline(CPU): distance stage finished in {:.3}s", td.elapsed().as_secs_f64());
         }
         1 => {
@@ -660,24 +668,46 @@ fn sketching_kmerType<Kmer, F>(
             let tq = Instant::now();
             println!("Sketching query genomes with RevOptDens...");
             let query_sketches = sketch_files(query_genomes, &sketcher, kmer_hash_fn);
-            log::info!("pipeline(CPU): query sketching finished in {:.3}s", tq.elapsed().as_secs_f64());
-
-            let tr = Instant::now();
-            println!("Sketching reference genomes with RevOptDens...");
-            let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
-            log::info!("pipeline(CPU): reference sketching finished in {:.3}s", tr.elapsed().as_secs_f64());
+            log::info!(
+                "pipeline(CPU): query sketching finished in {:.3}s",
+                tq.elapsed().as_secs_f64()
+            );
 
             let td = Instant::now();
             println!("Performing pairwise comparisons...");
-            write_results(
-                output,
-                matrix_output,
-                query_genomes,
-                reference_genomes,
-                &query_sketches,
-                &reference_sketches,
-                kmer_size,
-            );
+
+            if self_compare {
+                log::info!("pipeline(CPU): self-comparison mode, reusing query sketches as reference sketches");
+                write_results(
+                    output,
+                    matrix_output,
+                    true,
+                    query_genomes,
+                    reference_genomes,
+                    &query_sketches,
+                    &query_sketches,
+                    kmer_size,
+                );
+            } else {
+                let tr = Instant::now();
+                println!("Sketching reference genomes with RevOptDens...");
+                let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
+                log::info!(
+                    "pipeline(CPU): reference sketching finished in {:.3}s",
+                    tr.elapsed().as_secs_f64()
+                );
+
+                write_results(
+                    output,
+                    matrix_output,
+                    false,
+                    query_genomes,
+                    reference_genomes,
+                    &query_sketches,
+                    &reference_sketches,
+                    kmer_size,
+                );
+            }
             log::info!("pipeline(CPU): distance stage finished in {:.3}s", td.elapsed().as_secs_f64());
         }
         _ => panic!("Only densification = 0 or 1 are supported!"),
@@ -693,6 +723,7 @@ fn sketching_kmerType<Kmer, F>(
 fn sketching_kmerType<Kmer, F>(
     query_genomes: &[String],
     reference_genomes: &[String],
+    self_compare: bool,
     sketch_args: &SeqSketcherParams,
     kmer_hash_fn: F,
     dens: usize,
@@ -721,24 +752,46 @@ fn sketching_kmerType<Kmer, F>(
             let tq = Instant::now();
             println!("Sketching query genomes with OptDens...");
             let query_sketches = sketch_files(query_genomes, &sketcher, kmer_hash_fn);
-            log::info!("pipeline(GPU): query sketching finished in {:.3}s", tq.elapsed().as_secs_f64());
-
-            let tr = Instant::now();
-            println!("Sketching reference genomes with OptDens...");
-            let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
-            log::info!("pipeline(GPU): reference sketching finished in {:.3}s", tr.elapsed().as_secs_f64());
+            log::info!(
+                "pipeline(GPU): query sketching finished in {:.3}s",
+                tq.elapsed().as_secs_f64()
+            );
 
             let td = Instant::now();
             println!("Performing GPU pairwise comparisons...");
-            write_results_gpu_u16(
-                output,
-                matrix_output,
-                query_genomes,
-                reference_genomes,
-                &query_sketches,
-                &reference_sketches,
-                kmer_size,
-            );
+
+            if self_compare {
+                log::info!("pipeline(GPU): self-comparison mode, reusing query sketches as reference sketches");
+                write_results_gpu_u16(
+                    output,
+                    matrix_output,
+                    true,
+                    query_genomes,
+                    reference_genomes,
+                    &query_sketches,
+                    &query_sketches,
+                    kmer_size,
+                );
+            } else {
+                let tr = Instant::now();
+                println!("Sketching reference genomes with OptDens...");
+                let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
+                log::info!(
+                    "pipeline(GPU): reference sketching finished in {:.3}s",
+                    tr.elapsed().as_secs_f64()
+                );
+
+                write_results_gpu_u16(
+                    output,
+                    matrix_output,
+                    false,
+                    query_genomes,
+                    reference_genomes,
+                    &query_sketches,
+                    &reference_sketches,
+                    kmer_size,
+                );
+            }
             log::info!("pipeline(GPU): distance stage finished in {:.3}s", td.elapsed().as_secs_f64());
         }
         1 => {
@@ -747,24 +800,46 @@ fn sketching_kmerType<Kmer, F>(
             let tq = Instant::now();
             println!("Sketching query genomes with RevOptDens...");
             let query_sketches = sketch_files(query_genomes, &sketcher, kmer_hash_fn);
-            log::info!("pipeline(GPU): query sketching finished in {:.3}s", tq.elapsed().as_secs_f64());
-
-            let tr = Instant::now();
-            println!("Sketching reference genomes with RevOptDens...");
-            let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
-            log::info!("pipeline(GPU): reference sketching finished in {:.3}s", tr.elapsed().as_secs_f64());
+            log::info!(
+                "pipeline(GPU): query sketching finished in {:.3}s",
+                tq.elapsed().as_secs_f64()
+            );
 
             let td = Instant::now();
             println!("Performing GPU pairwise comparisons...");
-            write_results_gpu_u16(
-                output,
-                matrix_output,
-                query_genomes,
-                reference_genomes,
-                &query_sketches,
-                &reference_sketches,
-                kmer_size,
-            );
+
+            if self_compare {
+                log::info!("pipeline(GPU): self-comparison mode, reusing query sketches as reference sketches");
+                write_results_gpu_u16(
+                    output,
+                    matrix_output,
+                    true,
+                    query_genomes,
+                    reference_genomes,
+                    &query_sketches,
+                    &query_sketches,
+                    kmer_size,
+                );
+            } else {
+                let tr = Instant::now();
+                println!("Sketching reference genomes with RevOptDens...");
+                let reference_sketches = sketch_files(reference_genomes, &sketcher, kmer_hash_fn);
+                log::info!(
+                    "pipeline(GPU): reference sketching finished in {:.3}s",
+                    tr.elapsed().as_secs_f64()
+                );
+
+                write_results_gpu_u16(
+                    output,
+                    matrix_output,
+                    false,
+                    query_genomes,
+                    reference_genomes,
+                    &query_sketches,
+                    &reference_sketches,
+                    kmer_size,
+                );
+            }
             log::info!("pipeline(GPU): distance stage finished in {:.3}s", td.elapsed().as_secs_f64());
         }
         _ => panic!("Only densification = 0 or 1 are supported!"),
@@ -797,8 +872,8 @@ fn main() {
                 .short('r')
                 .long("reference_list")
                 .value_name("REFERENCE_LIST_FILE")
-                .help("Reference genome list file (one FASTA/FNA file path per line, .gz supported)")
-                .required(true)
+                .help("Reference genome list file (one FASTA/FNA file path per line, .gz supported). If omitted, query_list is reused for self-comparison")
+                .required(false)
                 .action(ArgAction::Set),
         )
         .arg(
@@ -833,13 +908,10 @@ fn main() {
         )
         .arg(
             Arg::new("threads")
-                .short('t')
                 .long("threads")
-                .value_name("THREADS")
-                .help("Number of threads to use in parallel")
-                .default_value("1")
-                .value_parser(clap::value_parser!(usize))
-                .action(ArgAction::Set),
+                .short('T')
+                .help("Number of threads, default all logical cores")
+                .value_parser(clap::value_parser!(usize)),
         )
         .arg(
             Arg::new("matrix")
@@ -862,19 +934,24 @@ fn main() {
         .get_one::<String>("query_list")
         .expect("Query list is required")
         .to_string();
-    let reference_list = matches
-        .get_one::<String>("reference_list")
-        .expect("Reference list is required")
-        .to_string();
+
+    let reference_list_opt = matches.get_one::<String>("reference_list").cloned();
+    let self_compare = reference_list_opt.is_none();
+    let reference_list = reference_list_opt.unwrap_or_else(|| query_list.clone());
     let kmer_size = *matches.get_one::<usize>("kmer_size").unwrap();
     let sketch_size = *matches.get_one::<usize>("sketch_size").unwrap();
     let dens = *matches.get_one::<usize>("dens_opt").unwrap();
-    let threads = *matches.get_one::<usize>("threads").unwrap();
+    let threads = matches
+        .get_one::<usize>("threads")
+        .copied()
+        .unwrap_or_else(|| num_cpus::get());
+
+
     let matrix_output = matches.get_flag("matrix");
     let output = matches.get_one::<String>("output").cloned();
 
     log::info!(
-        "main: query_list={} reference_list={} kmer_size={} sketch_size={} dens={} threads={} output={:?} matrix_output={}",
+        "main: query_list={} reference_list={} kmer_size={} sketch_size={} dens={} threads={} output={:?} matrix_output={} self_compare={}",
         query_list,
         reference_list,
         kmer_size,
@@ -882,7 +959,8 @@ fn main() {
         dens,
         threads,
         output,
-        matrix_output
+        matrix_output,
+        self_compare
     );
 
     ThreadPoolBuilder::new()
@@ -917,6 +995,7 @@ fn main() {
         sketching_kmerType::<Kmer32bit, _>(
             &query_genomes,
             &reference_genomes,
+            self_compare,
             &sketch_args,
             kmer_hash_fn_32bit,
             dens,
@@ -940,6 +1019,7 @@ fn main() {
         sketching_kmerType::<Kmer16b32bit, _>(
             &query_genomes,
             &reference_genomes,
+            self_compare,
             &sketch_args,
             kmer_hash_fn_16b32bit,
             dens,
@@ -960,6 +1040,7 @@ fn main() {
         sketching_kmerType::<Kmer64bit, _>(
             &query_genomes,
             &reference_genomes,
+            self_compare,
             &sketch_args,
             kmer_hash_fn_64bit,
             dens,
