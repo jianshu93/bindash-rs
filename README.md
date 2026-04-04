@@ -5,33 +5,22 @@
 One Permutation MinHash with Optimal/Faster Densification in Rust
 
 ## Install
-### Install via bioconda
-```bash
-conda install -c bioconda -c conda-forge bindash-rs
-```
-
-### Install via cargo
-```bash
-### Install from cargo, install Rustup first here: https://rustup.rs, cargo will be installed by default
-cargo install bindash
-```
 ### Compile from source
 ```bash
 git clone https://github.com/jianshu93/bindash-rs
 cd bindash-rs
-cargo build --release
-./target/release/bindash -h
+cargo build --release --features cuda
+./target/release/bindash-cuda -h
 
 ```
 
 ## Usage
 ```bash
+************** initializing logger *****************
 
- ************** initializing logger *****************
+Binwise Densified MinHash for Genome/Metagenome/Pangenome Comparisons
 
-Binwise Densifed MinHash for Genome/Metagenome/Pangenome Comparisons
-
-Usage: bindash [OPTIONS] --query_list <QUERY_LIST_FILE> --reference_list <REFERENCE_LIST_FILE>
+Usage: bindash-cuda [OPTIONS] --query_list <QUERY_LIST_FILE> --reference_list <REFERENCE_LIST_FILE>
 
 Options:
   -q, --query_list <QUERY_LIST_FILE>
@@ -43,11 +32,13 @@ Options:
   -s, --sketch_size <SKETCH_SIZE>
           MinHash sketch size [default: 2048]
   -d, --densification <DENS_OPT>
-          Densification strategy, 0 for optimal densification, 1 for reverse optimal/faster densification [default: 0]
+          Densification strategy, 0 = optimal densification, 1 = reverse optimal/faster densification [default: 0]
   -t, --threads <THREADS>
           Number of threads to use in parallel [default: 1]
+      --matrix
+          Write dense rectangular matrix output
   -o, --output <OUTPUT_FILE>
-          Output file (defaults to stdout)
+          Output file (zstd-compressed by default)
   -h, --help
           Print help
   -V, --version
