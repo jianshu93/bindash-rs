@@ -5,21 +5,14 @@ use rayon::ThreadPoolBuilder;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use needletail::{parse_fastx_file, Sequence};
 use num;
 
 use kmerutils::base::{
-    alphabet::Alphabet2b,
-    kmergenerator::*,
-    sequence::Sequence as SequenceStruct,
-    CompressedKmerT,
-    Kmer16b32bit,
-    Kmer32bit,
-    Kmer64bit,
-    KmerBuilder,
+    alphabet::Alphabet2b, kmergenerator::*, sequence::Sequence as SequenceStruct, CompressedKmerT,
+    Kmer16b32bit, Kmer32bit, Kmer64bit, KmerBuilder,
 };
 use kmerutils::sketcharg::{DataType, SeqSketcherParams, SketchAlgo};
 use kmerutils::sketching::setsketchert::{
@@ -28,17 +21,31 @@ use kmerutils::sketching::setsketchert::{
     SeqSketcherT, // trait
 };
 use ryu;
-use zstd;
 use std::time::Instant;
+use zstd;
 
-#[cfg(not(feature = "cuda"))]
-use anndists::dist::{Distance, DistHamming};
+#[cfg(all(feature = "cuda", feature = "metal"))]
+compile_error!("features 'cuda' and 'metal' are mutually exclusive");
+
+#[cfg(all(feature = "cuda", not(target_os = "linux")))]
+compile_error!("feature 'cuda' is supported only on Linux");
+
+#[cfg(all(feature = "metal", not(target_os = "macos")))]
+compile_error!("feature 'metal' is supported only on macOS");
+
+use anndists::dist::{DistHamming, Distance};
 
 #[cfg(feature = "cuda")]
 mod disthamming_gpu;
 
+#[cfg(feature = "metal")]
+mod disthamming_metal;
+
 #[cfg(feature = "cuda")]
 use disthamming_gpu::pairwise_hamming_rect_multi_gpu_u16;
+
+#[cfg(feature = "metal")]
+use disthamming_metal::pairwise_hamming_rect_metal_u16;
 
 /// Converts ASCII-encoded bases (from Needletail) into our `SequenceStruct`.
 fn ascii_to_seq(bases: &[u8]) -> Result<SequenceStruct, ()> {
@@ -57,7 +64,6 @@ fn read_genome_list(filepath: &str) -> Vec<String> {
         .map(|line| line.expect("Error reading genome list"))
         .collect()
 }
-
 
 fn sketch_files<Kmer, Sketcher, F>(
     file_paths: &[String],
@@ -120,14 +126,14 @@ where
     out
 }
 
-/// Computes the distance between two sketches (as `Vec<u64>`) using DistHamming,
-/// then applies your transformation:
-///
-///    distance = -ln( (2*j) / (1 + j) ) / kmer_size
-///
-/// where j = 1 - hamming_distance (assuming DistHamming returns normalized distance).
 fn compute_distance_from_hamming(h: f64, kmer_size: usize) -> f64 {
-    let h = if h <= 0.0 { 0.0 } else if h >= 1.0 { 1.0 } else { h };
+    let h = if h <= 0.0 {
+        0.0
+    } else if h >= 1.0 {
+        1.0
+    } else {
+        h
+    };
 
     let mut j = 1.0 - h;
     if j <= 0.0 {
@@ -137,18 +143,6 @@ fn compute_distance_from_hamming(h: f64, kmer_size: usize) -> f64 {
     let fraction = (2.0 * j) / (1.0 + j);
     -fraction.ln() / (kmer_size as f64)
 }
-
-#[cfg(not(feature = "cuda"))]
-fn compute_distance<Sig>(query_sig: &[Sig], reference_sig: &[Sig], kmer_size: usize) -> f64
-where
-    Sig: Send + Sync,
-    DistHamming: Distance<Sig>,
-{
-    let dist_hamming = DistHamming;
-    let h: f64 = dist_hamming.eval(query_sig, reference_sig) as f64;
-    compute_distance_from_hamming(h, kmer_size)
-}
-
 
 fn make_zstd_output_writer(output: Option<String>) -> Box<dyn Write> {
     match output {
@@ -168,8 +162,6 @@ fn make_zstd_output_writer(output: Option<String>) -> Box<dyn Write> {
     }
 }
 
-
-#[cfg(not(feature = "cuda"))]
 fn write_results<Sig>(
     output: Option<String>,
     matrix_output: bool,
@@ -271,8 +263,7 @@ fn write_results<Sig>(
                             continue;
                         }
 
-                        let mut distance =
-                            compute_distance_from_hamming(row[ri] as f64, kmer_size);
+                        let mut distance = compute_distance_from_hamming(row[ri] as f64, kmer_size);
 
                         if self_compare && ri == qi {
                             distance = 0.0;
@@ -315,8 +306,7 @@ fn write_results<Sig>(
                             continue;
                         }
 
-                        let mut distance =
-                            compute_distance_from_hamming(row[ri] as f64, kmer_size);
+                        let mut distance = compute_distance_from_hamming(row[ri] as f64, kmer_size);
 
                         if self_compare && ri == qi {
                             distance = 0.0;
@@ -356,7 +346,7 @@ fn write_results<Sig>(
     );
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn write_results_gpu_u16(
     output: Option<String>,
     matrix_output: bool,
@@ -430,10 +420,13 @@ fn write_results_gpu_u16(
 
     let mut hamming_rect = vec![0.0f32; nq * nr];
 
+    #[cfg(feature = "cuda")]
     let block_cols = 2048usize.min(nr.max(1));
+    #[cfg(feature = "cuda")]
     let block_rows_gpu = 2048usize.min(nq.max(1));
 
     let hamming_t0 = Instant::now();
+    #[cfg(feature = "cuda")]
     pairwise_hamming_rect_multi_gpu_u16(
         &query_flat,
         nq,
@@ -444,7 +437,11 @@ fn write_results_gpu_u16(
         block_rows_gpu,
         block_cols,
     )
-    .expect("GPU rectangular Hamming failed");
+    .expect("CUDA rectangular Hamming failed");
+
+    #[cfg(feature = "metal")]
+    pairwise_hamming_rect_metal_u16(&query_flat, nq, &reference_flat, nr, k, &mut hamming_rect)
+        .expect("Metal rectangular Hamming failed");
 
     log::info!(
         "GPU distance: raw GPU Hamming stage finished in {:.3}s",
@@ -589,8 +586,7 @@ fn write_results_gpu_u16(
 ///
 /// We instantiate the internal minhash with `S = f32`,
 /// but the returned signature type is `u64` (per your kmerutils implementation).
-#[cfg(not(feature = "cuda"))]
-fn sketching_kmerType<Kmer, F>(
+fn sketching_kmer_type_cpu<Kmer, F>(
     query_genomes: &[String],
     reference_genomes: &[String],
     self_compare: bool,
@@ -660,7 +656,10 @@ fn sketching_kmerType<Kmer, F>(
                     kmer_size,
                 );
             }
-            log::info!("pipeline(CPU): distance stage finished in {:.3}s", td.elapsed().as_secs_f64());
+            log::info!(
+                "pipeline(CPU): distance stage finished in {:.3}s",
+                td.elapsed().as_secs_f64()
+            );
         }
         1 => {
             let sketcher = RevOptDensHashSketch::<Kmer, f32>::new(sketch_args);
@@ -708,7 +707,10 @@ fn sketching_kmerType<Kmer, F>(
                     kmer_size,
                 );
             }
-            log::info!("pipeline(CPU): distance stage finished in {:.3}s", td.elapsed().as_secs_f64());
+            log::info!(
+                "pipeline(CPU): distance stage finished in {:.3}s",
+                td.elapsed().as_secs_f64()
+            );
         }
         _ => panic!("Only densification = 0 or 1 are supported!"),
     }
@@ -719,8 +721,8 @@ fn sketching_kmerType<Kmer, F>(
     );
 }
 
-#[cfg(feature = "cuda")]
-fn sketching_kmerType<Kmer, F>(
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn sketching_kmer_type_gpu<Kmer, F>(
     query_genomes: &[String],
     reference_genomes: &[String],
     self_compare: bool,
@@ -792,7 +794,10 @@ fn sketching_kmerType<Kmer, F>(
                     kmer_size,
                 );
             }
-            log::info!("pipeline(GPU): distance stage finished in {:.3}s", td.elapsed().as_secs_f64());
+            log::info!(
+                "pipeline(GPU): distance stage finished in {:.3}s",
+                td.elapsed().as_secs_f64()
+            );
         }
         1 => {
             let sketcher = RevOptDensHashSketch::<Kmer, f32>::new(sketch_args);
@@ -840,7 +845,10 @@ fn sketching_kmerType<Kmer, F>(
                     kmer_size,
                 );
             }
-            log::info!("pipeline(GPU): distance stage finished in {:.3}s", td.elapsed().as_secs_f64());
+            log::info!(
+                "pipeline(GPU): distance stage finished in {:.3}s",
+                td.elapsed().as_secs_f64()
+            );
         }
         _ => panic!("Only densification = 0 or 1 are supported!"),
     }
@@ -851,7 +859,26 @@ fn sketching_kmerType<Kmer, F>(
     );
 }
 
-fn main() {
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+enum Backend {
+    Cpu,
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    Gpu,
+}
+
+#[allow(dead_code)]
+pub fn run_cpu() {
+    run(Backend::Cpu);
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+#[allow(dead_code)]
+pub fn run_gpu() {
+    run(Backend::Gpu);
+}
+
+fn run(backend: Backend) {
     println!("\n ************** initializing logger *****************\n");
     let _ = env_logger::Builder::from_default_env().init();
 
@@ -946,12 +973,12 @@ fn main() {
         .copied()
         .unwrap_or_else(|| num_cpus::get());
 
-
     let matrix_output = matches.get_flag("matrix");
     let output = matches.get_one::<String>("output").cloned();
 
     log::info!(
-        "main: query_list={} reference_list={} kmer_size={} sketch_size={} dens={} threads={} output={:?} matrix_output={} self_compare={}",
+        "main: backend={:?} query_list={} reference_list={} kmer_size={} sketch_size={} dens={} threads={} output={:?} matrix_output={} self_compare={}",
+        backend,
         query_list,
         reference_list,
         kmer_size,
@@ -983,6 +1010,36 @@ fn main() {
         DataType::DNA,
     );
 
+    macro_rules! run_backend {
+        ($kmer:ty, $hash_fn:expr) => {
+            match backend {
+                Backend::Cpu => sketching_kmer_type_cpu::<$kmer, _>(
+                    &query_genomes,
+                    &reference_genomes,
+                    self_compare,
+                    &sketch_args,
+                    $hash_fn,
+                    dens,
+                    output,
+                    matrix_output,
+                    kmer_size,
+                ),
+                #[cfg(any(feature = "cuda", feature = "metal"))]
+                Backend::Gpu => sketching_kmer_type_gpu::<$kmer, _>(
+                    &query_genomes,
+                    &reference_genomes,
+                    self_compare,
+                    &sketch_args,
+                    $hash_fn,
+                    dens,
+                    output,
+                    matrix_output,
+                    kmer_size,
+                ),
+            }
+        };
+    }
+
     if kmer_size <= 14 {
         let nb_alphabet_bits = 2;
         let kmer_hash_fn_32bit = move |kmer: &Kmer32bit| -> <Kmer32bit as CompressedKmerT>::Val {
@@ -992,41 +1049,20 @@ fn main() {
             kmer.get_compressed_value() & mask
         };
 
-        sketching_kmerType::<Kmer32bit, _>(
-            &query_genomes,
-            &reference_genomes,
-            self_compare,
-            &sketch_args,
-            kmer_hash_fn_32bit,
-            dens,
-            output,
-            matrix_output,
-            kmer_size,
-        );
+        run_backend!(Kmer32bit, kmer_hash_fn_32bit);
     } else if kmer_size == 16 {
         let nb_alphabet_bits = 2;
         let kmer_hash_fn_16b32bit =
             move |kmer: &Kmer16b32bit| -> <Kmer16b32bit as CompressedKmerT>::Val {
                 let canonical = kmer.reverse_complement().min(*kmer);
-                let mask: <Kmer16b32bit as CompressedKmerT>::Val =
-                    num::NumCast::from::<u64>(
-                        (1u64 << (nb_alphabet_bits * kmer.get_nb_base())) - 1,
-                    )
-                    .unwrap();
+                let mask: <Kmer16b32bit as CompressedKmerT>::Val = num::NumCast::from::<u64>(
+                    (1u64 << (nb_alphabet_bits * kmer.get_nb_base())) - 1,
+                )
+                .unwrap();
                 canonical.get_compressed_value() & mask
             };
 
-        sketching_kmerType::<Kmer16b32bit, _>(
-            &query_genomes,
-            &reference_genomes,
-            self_compare,
-            &sketch_args,
-            kmer_hash_fn_16b32bit,
-            dens,
-            output,
-            matrix_output,
-            kmer_size,
-        );
+        run_backend!(Kmer16b32bit, kmer_hash_fn_16b32bit);
     } else if kmer_size <= 32 {
         let nb_alphabet_bits = 2;
         let kmer_hash_fn_64bit = move |kmer: &Kmer64bit| -> <Kmer64bit as CompressedKmerT>::Val {
@@ -1037,17 +1073,7 @@ fn main() {
             canonical.get_compressed_value() & mask
         };
 
-        sketching_kmerType::<Kmer64bit, _>(
-            &query_genomes,
-            &reference_genomes,
-            self_compare,
-            &sketch_args,
-            kmer_hash_fn_64bit,
-            dens,
-            output,
-            matrix_output,
-            kmer_size,
-        );
+        run_backend!(Kmer64bit, kmer_hash_fn_64bit);
     } else {
         panic!("kmer_size must not be 15 and cannot exceed 32!");
     }
